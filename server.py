@@ -21,13 +21,16 @@ app = FastAPI(
     description="Chat API for NRL try scoring stats (FTS, ATS, LTS, FTS2H, 2+).",
 )
 
-CORS_ORIGINS = os.environ.get(
-    "CORS_ORIGINS",
-    "http://localhost:3000,http://127.0.0.1:3000",
-)
+_DEFAULT_CORS = "http://localhost:3000,http://127.0.0.1:3000"
+_VERCEL_ORIGIN = "https://nrl-tryscorers-frontend.vercel.app"
+CORS_ORIGINS = os.environ.get("CORS_ORIGINS", _DEFAULT_CORS)
+# Always allow Vercel frontend when using default CORS (e.g. Railway without CORS_ORIGINS set)
+if CORS_ORIGINS.strip() == _DEFAULT_CORS:
+    CORS_ORIGINS = f"{CORS_ORIGINS},{_VERCEL_ORIGIN}"
+origins_list = [o.strip() for o in CORS_ORIGINS.split(",") if o.strip()]
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[o.strip() for o in CORS_ORIGINS.split(",") if o.strip()],
+    allow_origins=origins_list,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
