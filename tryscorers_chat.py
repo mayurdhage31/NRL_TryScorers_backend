@@ -376,6 +376,66 @@ def _recent_games_since_2024(df_full: pd.DataFrame, player_id: int) -> int:
     return int(df_full[(df_full["player_id"] == player_id) & (df_full["season"] >= 2024)]["Games played"].sum())
 
 
+def get_unique_players() -> list[dict[str, Any]]:
+    """Return list of unique players (player_id, name) sorted by name."""
+    df_full, _, _ = load_data()
+    if df_full.empty or "Player" not in df_full.columns or "player_id" not in df_full.columns:
+        return []
+    # One row per player_id, take first Player name
+    players = (
+        df_full.groupby("player_id", as_index=False)
+        .agg({"Player": "first"})
+        .sort_values("Player")
+    )
+    return [
+        {"player_id": int(r["player_id"]), "name": str(r["Player"]).strip()}
+        for _, r in players.iterrows()
+        if pd.notna(r["Player"]) and str(r["Player"]).strip()
+    ]
+
+
+def get_player_season_stats(player_id: int) -> list[dict[str, Any]]:
+    """Return per-season stats for one player: Games played, FTS, FTS historical odds, ATS, etc."""
+    df_full, _, _ = load_data()
+    sub = df_full[df_full["player_id"] == player_id].copy()
+    if sub.empty:
+        return []
+    # CSV has "2+", "2+ historical odds" - use STAT_2PLUS
+    odds_cols = [
+        "FTS historical odds", "ATS historical odds", "LTS historical odds",
+        "FTS2H historical odds", "2+ historical odds",
+    ]
+    for c in odds_cols:
+        if c in sub.columns:
+            sub[c] = pd.to_numeric(sub[c], errors="coerce")
+
+    out = []
+    for _, row in sub.sort_values("season").iterrows():
+        def _odds(val: Any) -> float | None:
+            if pd.isna(val) or val == "NA" or val == "":
+                return None
+            try:
+                return float(val)
+            except (TypeError, ValueError):
+                return None
+
+        out.append({
+            "season": int(row["season"]),
+            "games_played": int(row["Games played"]) if pd.notna(row["Games played"]) else 0,
+            "fts": int(row["FTS"]) if "FTS" in row and pd.notna(row["FTS"]) else 0,
+            "fts_historical_odds": _odds(row.get("FTS historical odds")),
+            "ats": int(row["ATS"]) if "ATS" in row and pd.notna(row["ATS"]) else 0,
+            "ats_historical_odds": _odds(row.get("ATS historical odds")),
+            "lts": int(row["LTS"]) if "LTS" in row and pd.notna(row["LTS"]) else 0,
+            "lts_historical_odds": _odds(row.get("LTS historical odds")),
+            "fts2h": int(row["FTS2H"]) if "FTS2H" in row and pd.notna(row["FTS2H"]) else 0,
+            "fts2h_historical_odds": _odds(row.get("FTS2H historical odds")),
+            "two_plus": int(row[STAT_2PLUS]) if STAT_2PLUS in row and pd.notna(row[STAT_2PLUS]) else 0,
+            "two_plus_historical_odds": _odds(row.get("2+ historical odds")),
+        })
+    return out
+
+
 def compute_rankings(
     stat_type: str,
     season_from: int,
@@ -473,6 +533,28 @@ def compute_value_analysis(
     }
 
 
+def _format_stat_block_lines(
+    label: str,
+    stat_type: str,
+    season_from: int,
+    season_to: int,
+    stats: dict[str, Any],
+) -> list[str]:
+    """Build multiline stat block: Player, Stat, Seasons, Games played, [STAT] hits, Rate, Historical odds."""
+    odds_str = f"${stats['hist_odds']:.2f}" if stats.get("hist_odds") is not None else "—"
+    season_range = f"{season_from}–{season_to}" if season_from != season_to else str(season_from)
+    pct = stats["pct"] if isinstance(stats.get("pct"), (int, float)) else 0.0
+    return [
+        f"Player: {label}",
+        f"Stat: {stat_type}",
+        f"Seasons: {season_range}",
+        f"Games played: {stats['total_games']}",
+        f"{stat_type} hits: {stats['stat_hits']}",
+        f"Rate: {pct:.2f}%",
+        f"Historical odds: {odds_str}",
+    ]
+
+
 def format_single_player_response(
     player_name: str,
     stat_type: str,
@@ -480,14 +562,14 @@ def format_single_player_response(
     season_to: int,
     stats: dict[str, Any],
 ) -> str:
-    """One line: Name (Team, Position) — STAT since YYYY: hits/games (pct%), hist $X.XX."""
+    """Compact multiline: each metric on its own line."""
     team, pos = _current_meta(player_name)
     label = player_name
     if team or pos:
         parts = [p for p in [team, pos] if p]
         label = f"{player_name} ({', '.join(parts)})"
-    odds_str = f"${stats['hist_odds']:.2f}" if stats.get("hist_odds") is not None else "N/A"
-    return f"{label} — {stat_type} since {season_from}: {stats['stat_hits']}/{stats['total_games']} ({stats['pct']}%), historical odds {odds_str}."
+    lines = _format_stat_block_lines(label, stat_type, season_from, season_to, stats)
+    return "\n".join(lines)
 
 
 def format_ranking_response(
@@ -500,20 +582,25 @@ def format_ranking_response(
     min_games_since_2024: int | None,
     min_pct: float | None = None,
 ) -> str:
-    """Numbered list plus filter summary."""
-    lines = []
+    """Numbered list with one stat per line; then filter summary."""
+    season_range = f"{season_from}–{season_to}" if season_from != season_to else str(season_from)
+    lines = [
+        f"Stat: {stat_type} (seasons {season_range})",
+        "",
+    ]
     for i, r in enumerate(rows, 1):
         label = r["player_name"]
         if r.get("team") or r.get("position"):
             parts = [p for p in [r.get("team"), r.get("position")] if p]
             label = f"{r['player_name']} ({', '.join(parts)})"
-        odds_str = f"${r['hist_odds']:.2f}" if r.get("hist_odds") is not None else "N/A"
-        lines.append(f"{i}. {label} — {stat_type} {r['stat_hits']}/{r['total_games']} ({r['pct']}%), hist {odds_str}")
+        odds_str = f"${r['hist_odds']:.2f}" if r.get("hist_odds") is not None else "—"
+        lines.append(f"{i}. {label}")
+        lines.append(f"   Games: {r['total_games']} · {stat_type}: {r['stat_hits']} ({r['pct']}%) · Hist odds: {odds_str}")
     filters = []
     if positions:
         filters.append(f"position = {', '.join(positions)}")
     filters.append(f"stat = {stat_type}")
-    filters.append(f"seasons = {season_from}-{season_to}")
+    filters.append(f"seasons = {season_range}")
     if min_games is not None:
         filters.append(f"min games = {min_games}")
     if min_games_since_2024 is not None:
@@ -521,8 +608,7 @@ def format_ranking_response(
     if min_pct is not None:
         filters.append(f"min rate = {min_pct}%")
     lines.append("")
-    lines.append("Filters applied: " + ", ".join(filters) + ".")
-    lines.append("Inactive since 2024 players excluded from rankings.")
+    lines.append("Filters: " + ", ".join(filters) + ". Inactive since 2024 excluded.")
     return "\n".join(lines)
 
 
@@ -532,15 +618,29 @@ def format_value_response(
     season_from: int,
     season_to: int,
 ) -> str:
-    """Value comparison line."""
+    """Value comparison: stat block plus market odds, implied prob, verdict, edge — one fact per line."""
     team, pos = _current_meta(player_name)
     label = player_name
     if team or pos:
         parts = [p for p in [team, pos] if p]
         label = f"{player_name} ({', '.join(parts)})"
-    odds_str = f"${value['hist_odds']:.2f}" if value.get("hist_odds") is not None else "N/A"
-    line = f"{label} — {value['stat_type']} since {season_from}: {value['stat_hits']}/{value['total_games']} ({value['pct']}%), historical odds {odds_str}. Market odds ${value['market_odds']:.2f} imply {value['implied_prob']}%, so this is {'positive' if value['positive_value'] else 'negative'} historical value by {value['edge_pct_points']:+.2f} percentage points."
-    return line
+    lines = _format_stat_block_lines(
+        label, value["stat_type"], season_from, season_to, value
+    )
+    edge = value["edge_pct_points"]
+    if abs(edge) < 0.5:
+        verdict = "Fair value"
+    elif value["positive_value"]:
+        verdict = "Positive value"
+    else:
+        verdict = "Negative value"
+    lines.extend([
+        f"Market odds: ${value['market_odds']:.2f}",
+        f"Implied probability: {value['implied_prob']:.2f}%",
+        f"Verdict: {verdict}",
+        f"Edge: {edge:+.2f} percentage points",
+    ])
+    return "\n".join(lines)
 
 
 def get_chat_response(message: str, history: list[dict]) -> str:

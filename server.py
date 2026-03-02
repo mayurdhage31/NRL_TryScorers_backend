@@ -67,6 +67,29 @@ def health():
     return {"status": "ok"}
 
 
+@app.get("/api/players")
+def list_players():
+    """Return unique players (player_id, name) for dropdown."""
+    try:
+        chat.load_data()
+    except FileNotFoundError as e:
+        raise HTTPException(status_code=503, detail=str(e))
+    return chat.get_unique_players()
+
+
+@app.get("/api/players/{player_id}/seasons")
+def player_seasons(player_id: int):
+    """Return per-season stats for the given player."""
+    try:
+        chat.load_data()
+    except FileNotFoundError as e:
+        raise HTTPException(status_code=503, detail=str(e))
+    rows = chat.get_player_season_stats(player_id)
+    if not rows:
+        raise HTTPException(status_code=404, detail="Player not found or no data")
+    return rows
+
+
 @app.post("/api/chat", response_model=ChatResponse)
 def post_chat(req: ChatRequest):
     """Non-streaming chat."""
