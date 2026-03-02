@@ -718,9 +718,12 @@ def get_chat_response(message: str, history: list[dict]) -> str:
 
 
 def stream_chat_response(message: str, history: list[dict]):
-    """Yield full response as chunks (word/sentence) for SSE."""
+    """Yield full response as chunks (word/sentence) for SSE. Preserves newlines."""
     full = get_chat_response(message, history)
-    # simple chunking by words
-    words = full.split()
-    for i, w in enumerate(words):
-        yield w + (" " if i < len(words) - 1 else "")
+    lines = full.split("\n")
+    for line_idx, line in enumerate(lines):
+        words = line.split()
+        for i, w in enumerate(words):
+            yield w + (" " if i < len(words) - 1 else "")
+        if line_idx < len(lines) - 1:
+            yield "\n"
