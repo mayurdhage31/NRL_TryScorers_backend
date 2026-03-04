@@ -30,7 +30,7 @@ _SUMMARY_CSV = {
     "LTS": ("lts_summary.csv",),
     "ATS": ("ats_summary.csv",),
     "FTS2H": ("fts2h_summary.csv",),
-    STAT_2PLUS: ("tpt_summary.csv",),
+    "2+": ("tpt_summary.csv",),
 }
 # Bookmaker columns in summary CSVs (price columns only)
 _PRICE_COLUMNS = {"Tab", "Neds", "Betright", "Bet365", "Sportsbet", "Pointsbet", "Dabble", "Playup", "Boombet", "Bluebet", "Unibet", "Topsport"}
