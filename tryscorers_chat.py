@@ -23,6 +23,17 @@ else:
 _FULL_CSV = os.path.join(_BASE_DIR, "Nrl_tryscorers_2020_2025_full.csv")
 _PLAYERS_CSV = os.path.join(_BASE_DIR, "NRL Players and Teams.csv")
 _LIVE_PRICES_CSV = os.path.join(_BASE_DIR, "live_prices.csv")
+# Summary CSVs (market-specific): best prices only from these, never fabricate
+_REPO_DATA = os.path.join(os.path.dirname(__file__), "..", "data")
+_SUMMARY_CSV = {
+    "FTS": ("fts_summary.csv",),
+    "LTS": ("lts_summary.csv",),
+    "ATS": ("ats_summary.csv",),
+    "FTS2H": ("fts2h_summary.csv",),
+    STAT_2PLUS: ("tpt_summary.csv",),
+}
+# Bookmaker columns in summary CSVs (price columns only)
+_PRICE_COLUMNS = {"Tab", "Neds", "Betright", "Bet365", "Sportsbet", "Pointsbet", "Dabble", "Playup", "Boombet", "Bluebet", "Unibet", "Topsport"}
 
 _df_full: pd.DataFrame | None = None
 _df_players: pd.DataFrame | None = None
@@ -252,18 +263,23 @@ def parse_query(message: str) -> ParsedQuery:
     # Position
     pq.positions = resolve_positions(norm)
 
-    # Market odds
+    # Market odds: $17, 17 for/ats/fts/odds, odds of X, or "31s"/"41s"/"81s" (same as $31, $41, $81)
     dollar = re.search(r"\$\s*(\d+(?:\.\d+)?)", message)  # $17 or $17.00
     if dollar:
         pq.market_odds = float(dollar.group(1))
     else:
-        num = re.search(r"\b(\d+(?:\.\d+)?)\s*(?:for|ats?|fts?|odds?)", norm)
-        if num:
-            pq.market_odds = float(num.group(1))
+        # e.g. "31s LTS", "41s FTS", "81s" - number + "s" means price in dollars
+        price_s = re.search(r"\b(\d+(?:\.\d+)?)\s*s\b", norm)
+        if price_s:
+            pq.market_odds = float(price_s.group(1))
         else:
-            odds = re.search(r"odds?\s+of\s+(\d+(?:\.\d+)?)", norm)
-            if odds:
-                pq.market_odds = float(odds.group(1))
+            num = re.search(r"\b(\d+(?:\.\d+)?)\s*(?:for|ats?|fts?|odds?)", norm)
+            if num:
+                pq.market_odds = float(num.group(1))
+            else:
+                odds = re.search(r"odds?\s+of\s+(\d+(?:\.\d+)?)", norm)
+                if odds:
+                    pq.market_odds = float(odds.group(1))
 
     # Player names: resolve after we have data
     pq.player_names = resolve_player_names(message, norm)
@@ -461,7 +477,7 @@ def get_player_season_stats(player_id: int) -> list[dict[str, Any]]:
 
 
 def _get_live_prices_df() -> pd.DataFrame:
-    """Return live prices DataFrame (may be empty). Load data if needed."""
+    """Return live prices DataFrame (may be empty). Load data if needed. Used only for value Q when user didn't give price."""
     load_data()
     global _df_live_prices
     if _df_live_prices is None:
@@ -469,28 +485,85 @@ def _get_live_prices_df() -> pd.DataFrame:
     return _df_live_prices if not _df_live_prices.empty else pd.DataFrame()
 
 
+def _get_best_prices_from_summary(player_name: str, market: str) -> list[dict[str, Any]]:
+    """Return list of {website, price} from market summary CSV only. No fabrication."""
+    market_norm = market.upper() if market != STAT_2PLUS else STAT_2PLUS
+    filenames = _SUMMARY_CSV.get(market_norm)
+    if not filenames:
+        return []
+    for base in (_BASE_DIR, _REPO_DATA):
+        path = os.path.join(base, filenames[0])
+        if not os.path.isfile(path):
+            continue
+        try:
+            df = pd.read_csv(path)
+            df.columns = [str(c).strip() for c in df.columns]
+            if "Player" not in df.columns:
+                return []
+            name_key = player_name.strip().lower()
+            mask = df["Player"].astype(str).str.strip().str.lower() == name_key
+            rows = df.loc[mask]
+            if rows.empty:
+                return []
+            offers = []
+            for _, row in rows.iterrows():
+                for col in df.columns:
+                    if col not in _PRICE_COLUMNS:
+                        continue
+                    try:
+                        v = row[col]
+                        if pd.isna(v) or v == "":
+                            continue
+                        p = float(pd.to_numeric(v, errors="coerce"))
+                        if p > 0:
+                            offers.append({"website": col, "price": p})
+                    except (TypeError, ValueError):
+                        continue
+            by_website: dict[str, float] = {}
+            for o in offers:
+                w = o["website"]
+                if w not in by_website or o["price"] > by_website[w]:
+                    by_website[w] = o["price"]
+            out = [{"website": w, "price": p} for w, p in by_website.items()]
+            out.sort(key=lambda x: -x["price"])
+            return out
+        except Exception:
+            continue
+    return []
+
+
 def get_live_prices(player_name: str, market: str) -> list[dict[str, Any]]:
-    """Return list of {website, price} for player-market, sorted by price descending (best first)."""
+    """Return list of {website, price} for player-market. Best-price questions use summary CSVs only."""
+    return _get_best_prices_from_summary(player_name, market)
+
+
+def _get_best_price_for_value(player_name: str, market: str) -> tuple[float | None, str | None]:
+    """Get single best price for value question when user didn't give price. Prefer summary CSVs, else live_prices.csv."""
+    offers = _get_best_prices_from_summary(player_name, market)
+    if offers:
+        return offers[0]["price"], offers[0]["website"]
     df = _get_live_prices_df()
     if df.empty or "Player" not in df.columns or "Market" not in df.columns or "Website" not in df.columns or "Price" not in df.columns:
-        return []
+        return None, None
     market_norm = market.upper() if market != STAT_2PLUS else STAT_2PLUS
     sub = df[
         (df["Player"].astype(str).str.strip().str.lower() == player_name.strip().lower())
         & (df["Market"].astype(str).str.strip().str.upper() == market_norm)
-    ].copy()
+    ]
     if sub.empty:
-        return []
+        return None, None
     sub = sub.dropna(subset=["Price"])
     sub = sub[sub["Price"] > 0]
-    rows = sub.sort_values("Price", ascending=False)
-    return [{"website": str(r["Website"]).strip(), "price": float(r["Price"])} for _, r in rows.iterrows()]
+    if sub.empty:
+        return None, None
+    best = sub.loc[sub["Price"].idxmax()]
+    return float(best["Price"]), str(best["Website"]).strip()
 
 
 def format_best_prices_response(player_name: str, market: str, offers: list[dict[str, Any]]) -> str:
-    """Format best available prices: always include website with each price (e.g. $81 on Topsport)."""
+    """Format best available prices from data only. Never fabricate."""
     if not offers:
-        return f"No live prices found for {player_name} {market}. Add a live_prices.csv in backend/data with columns: Player, Market, Website, Price."
+        return f"No price data available for {player_name} {market} in the current data. Prices are only taken from the summary CSVs (e.g. fts_summary.csv, lts_summary.csv); if this player/market is not listed there, we cannot show a price."
     lines = [f"Best available prices for {player_name} {market}:", ""]
     for o in offers:
         lines.append(f"${o['price']:.2f} on {o['website']}")
@@ -716,10 +789,14 @@ def format_value_response(
         f"Verdict: {verdict}",
         f"Edge: {edge:+.2f} percentage points",
     ])
-    if value.get("value_ratio") is not None and value["positive_value"]:
+    # Always include value-by multiplier and 20% benchmark when we have the numbers (Payne Haas format)
+    if value.get("value_ratio") is not None:
         lines.append(f"Value by: {value['value_ratio']:.2f}x (live price vs historical odds)")
     if value.get("value_floor") is not None:
         lines.append(f"Using 20% benchmark: still value down to ${value['value_floor']:.2f}; below that is not value.")
+    elif value.get("hist_odds") is not None and value["hist_odds"] > 0 and value["market_odds"]:
+        # Show 20% benchmark for non-value / fair value: price would need to be at or above historical for value
+        lines.append(f"Using 20% benchmark: would be value at or above ${value['hist_odds']:.2f}; below that is not value.")
     return "\n".join(lines)
 
 
@@ -753,12 +830,9 @@ def get_chat_response(message: str, history: list[dict]) -> str:
         market_odds = pq.market_odds
         website = None
         if (market_odds is None or market_odds <= 0) and ("value" in norm_msg or "how much" in norm_msg):
-            offers = get_live_prices(name, stat)
-            if offers:
-                market_odds = offers[0]["price"]
-                website = offers[0]["website"]
+            market_odds, website = _get_best_price_for_value(name, stat)
         if market_odds is None or market_odds <= 0:
-            return "Please give a price (e.g. Is $17 for Payne Haas FTS value?) or add live_prices.csv so I can use the best available price."
+            return "Please give a price (e.g. Is $17 for Payne Haas FTS value?, or '31s LTS' for $31) or ensure the player/market appears in the summary CSVs so I can use the best available price."
         value = compute_value_analysis(pid, stat, season_from, season_to, market_odds)
         return format_value_response(name, value, season_from, season_to, website=website)
     elif ("value" in norm_msg or "how much" in norm_msg) and not pq.player_names:
