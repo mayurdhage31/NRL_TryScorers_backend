@@ -22,9 +22,11 @@ else:
     _BASE_DIR = _data_dir if os.path.isfile(_full_path) else (os.path.dirname(_repo_data) if os.path.isfile(_repo_data) else _data_dir)
 _FULL_CSV = os.path.join(_BASE_DIR, "Nrl_tryscorers_2020_2025_full.csv")
 _PLAYERS_CSV = os.path.join(_BASE_DIR, "NRL Players and Teams.csv")
+_LIVE_PRICES_CSV = os.path.join(_BASE_DIR, "live_prices.csv")
 
 _df_full: pd.DataFrame | None = None
 _df_players: pd.DataFrame | None = None
+_df_live_prices: pd.DataFrame | None = None
 _available_seasons: list[int] = []
 
 # Stat column name for "2+" in CSV
@@ -108,7 +110,7 @@ STAT_ALIASES = {
 
 def load_data() -> tuple[pd.DataFrame, pd.DataFrame, list[int]]:
     """Load full tryscorers CSV and players/teams CSV; return (df_full, df_players, seasons)."""
-    global _df_full, _df_players, _available_seasons
+    global _df_full, _df_players, _df_live_prices, _available_seasons
     if _df_full is not None:
         return _df_full, _df_players if _df_players is not None else pd.DataFrame(), _available_seasons
 
@@ -133,6 +135,20 @@ def load_data() -> tuple[pd.DataFrame, pd.DataFrame, list[int]]:
             _df_players = pd.DataFrame()
     else:
         _df_players = pd.DataFrame()
+
+    # Live prices (optional): Player, Market, Website, Price
+    if os.path.isfile(_LIVE_PRICES_CSV):
+        try:
+            _df_live_prices = pd.read_csv(_LIVE_PRICES_CSV)
+            _df_live_prices.columns = [c.strip() for c in _df_live_prices.columns]
+            if "Price" in _df_live_prices.columns:
+                _df_live_prices["Price"] = pd.to_numeric(_df_live_prices["Price"], errors="coerce")
+            else:
+                _df_live_prices = pd.DataFrame()
+        except Exception:
+            _df_live_prices = pd.DataFrame()
+    else:
+        _df_live_prices = pd.DataFrame()
 
     return _df_full, _df_players, _available_seasons
 
@@ -159,6 +175,7 @@ class ParsedQuery:
     min_pct: float | None = None  # e.g. "better than 1 in 10" -> 10.0
     positions: list[str] = field(default_factory=list)
     market_odds: float | None = None
+    best_price_request: bool = False  # "best available price" for player-market
     raw_message: str = ""
 
 
@@ -250,6 +267,13 @@ def parse_query(message: str) -> ParsedQuery:
 
     # Player names: resolve after we have data
     pq.player_names = resolve_player_names(message, norm)
+
+    # Best available price: "best price", "best available price", "prices for X FTS"
+    if re.search(r"best\s+(available\s+)?price", norm) or re.search(r"price[s]?\s+for\s+.+\s+(fts|ats|lts|fts2h|2\+)", norm):
+        pq.best_price_request = True
+    if pq.stat_type and pq.player_names and ("price" in norm or "odds" in norm):
+        if re.search(r"(what|best|available|current)\s+(is\s+)?(the\s+)?(best\s+)?(price|odds)", norm):
+            pq.best_price_request = True
 
     return pq
 
@@ -436,6 +460,43 @@ def get_player_season_stats(player_id: int) -> list[dict[str, Any]]:
     return out
 
 
+def _get_live_prices_df() -> pd.DataFrame:
+    """Return live prices DataFrame (may be empty). Load data if needed."""
+    load_data()
+    global _df_live_prices
+    if _df_live_prices is None:
+        _df_live_prices = pd.DataFrame()
+    return _df_live_prices if not _df_live_prices.empty else pd.DataFrame()
+
+
+def get_live_prices(player_name: str, market: str) -> list[dict[str, Any]]:
+    """Return list of {website, price} for player-market, sorted by price descending (best first)."""
+    df = _get_live_prices_df()
+    if df.empty or "Player" not in df.columns or "Market" not in df.columns or "Website" not in df.columns or "Price" not in df.columns:
+        return []
+    market_norm = market.upper() if market != STAT_2PLUS else STAT_2PLUS
+    sub = df[
+        (df["Player"].astype(str).str.strip().str.lower() == player_name.strip().lower())
+        & (df["Market"].astype(str).str.strip().str.upper() == market_norm)
+    ].copy()
+    if sub.empty:
+        return []
+    sub = sub.dropna(subset=["Price"])
+    sub = sub[sub["Price"] > 0]
+    rows = sub.sort_values("Price", ascending=False)
+    return [{"website": str(r["Website"]).strip(), "price": float(r["Price"])} for _, r in rows.iterrows()]
+
+
+def format_best_prices_response(player_name: str, market: str, offers: list[dict[str, Any]]) -> str:
+    """Format best available prices: always include website with each price (e.g. $81 on Topsport)."""
+    if not offers:
+        return f"No live prices found for {player_name} {market}. Add a live_prices.csv in backend/data with columns: Player, Market, Website, Price."
+    lines = [f"Best available prices for {player_name} {market}:", ""]
+    for o in offers:
+        lines.append(f"${o['price']:.2f} on {o['website']}")
+    return "\n".join(lines)
+
+
 def compute_rankings(
     stat_type: str,
     season_from: int,
@@ -508,6 +569,10 @@ def compute_rankings(
     return result
 
 
+# 20% benchmark: available price can drop up to 20% below a value price and still be "value"
+VALUE_FLOOR_PCT = 0.80
+
+
 def compute_value_analysis(
     player_id: int,
     stat_type: str,
@@ -515,21 +580,28 @@ def compute_value_analysis(
     season_to: int,
     market_odds: float,
 ) -> dict[str, Any]:
-    """Historical prob vs implied prob; edge in percentage points."""
+    """Historical prob vs implied prob; edge in percentage points; value ratio (live/historical)."""
     res = compute_player_stats(player_id, stat_type, season_from, season_to)
     total_games = res["total_games"]
     stat_hits = res["stat_hits"]
     hist_prob = (stat_hits / total_games) if total_games else 0.0
-    fair_odds = (total_games / stat_hits) if stat_hits else None
+    hist_odds = (total_games / stat_hits) if stat_hits else None
     implied_prob = 1.0 / market_odds if market_odds else 0.0
     edge_pct = (hist_prob - implied_prob) * 100
+    positive_value = hist_prob > implied_prob
+    value_ratio = (market_odds / hist_odds) if (hist_odds and hist_odds > 0 and market_odds) else None
+    # 20% rule: still value if price >= this value price * VALUE_FLOOR_PCT
+    value_floor = round(market_odds * VALUE_FLOOR_PCT, 2) if positive_value and market_odds else None
     return {
         **res,
         "market_odds": market_odds,
+        "hist_odds": hist_odds,
         "hist_prob": round(hist_prob * 100, 2),
         "implied_prob": round(implied_prob * 100, 2),
         "edge_pct_points": round(edge_pct, 2),
-        "positive_value": hist_prob > implied_prob,
+        "positive_value": positive_value,
+        "value_ratio": round(value_ratio, 2) if value_ratio is not None else None,
+        "value_floor": value_floor,
     }
 
 
@@ -617,8 +689,9 @@ def format_value_response(
     value: dict[str, Any],
     season_from: int,
     season_to: int,
+    website: str | None = None,
 ) -> str:
-    """Value comparison: stat block plus market odds, implied prob, verdict, edge — one fact per line."""
+    """Value comparison: stat block, market odds (with website if provided), implied prob, verdict, value-by-Xx, 20% rule."""
     team, pos = _current_meta(player_name)
     label = player_name
     if team or pos:
@@ -631,15 +704,22 @@ def format_value_response(
     if abs(edge) < 0.5:
         verdict = "Fair value"
     elif value["positive_value"]:
-        verdict = "Positive value"
+        verdict = "Value"
     else:
-        verdict = "Negative value"
+        verdict = "Not value"
+    price_str = f"${value['market_odds']:.2f}"
+    if website:
+        price_str += f" on {website}"
+    lines.append(f"Live price: {price_str}")
     lines.extend([
-        f"Market odds: ${value['market_odds']:.2f}",
         f"Implied probability: {value['implied_prob']:.2f}%",
         f"Verdict: {verdict}",
         f"Edge: {edge:+.2f} percentage points",
     ])
+    if value.get("value_ratio") is not None and value["positive_value"]:
+        lines.append(f"Value by: {value['value_ratio']:.2f}x (live price vs historical odds)")
+    if value.get("value_floor") is not None:
+        lines.append(f"Using 20% benchmark: still value down to ${value['value_floor']:.2f}; below that is not value.")
     return "\n".join(lines)
 
 
@@ -648,13 +728,19 @@ def get_chat_response(message: str, history: list[dict]) -> str:
     load_data()
     pq = parse_query(message)
     season_from, season_to = resolve_timeframe(pq)
-
-    # Value question: only when we have both market odds and a player (or explicit "value"/"odds" phrasing)
     norm_msg = normalize_text(message)
+
+    # Best available price: always include website with price (e.g. $81 on Topsport)
+    if pq.best_price_request and pq.player_names and pq.stat_type:
+        name = pq.player_names[0]
+        stat = pq.stat_type or "ATS"
+        offers = get_live_prices(name, stat)
+        return format_best_prices_response(name, stat, offers)
+
+    # Value question: use market_odds from message or best live price; include website and value-by-Xx, 20% rule
     is_value_question = (
-        pq.market_odds is not None
-        and pq.market_odds > 0
-        and (pq.player_names or "value" in norm_msg or "how much" in norm_msg)
+        (pq.market_odds is not None and pq.market_odds > 0 or "value" in norm_msg or "how much" in norm_msg)
+        and pq.player_names
     )
     if is_value_question and pq.player_names:
         stat = pq.stat_type or "FTS"
@@ -664,9 +750,18 @@ def get_chat_response(message: str, history: list[dict]) -> str:
         if match.empty:
             return f"No player matched: '{name}'."
         pid = int(match.iloc[0]["player_id"])
-        value = compute_value_analysis(pid, stat, season_from, season_to, pq.market_odds)
-        return format_value_response(name, value, season_from, season_to)
-    elif is_value_question and not pq.player_names:
+        market_odds = pq.market_odds
+        website = None
+        if (market_odds is None or market_odds <= 0) and ("value" in norm_msg or "how much" in norm_msg):
+            offers = get_live_prices(name, stat)
+            if offers:
+                market_odds = offers[0]["price"]
+                website = offers[0]["website"]
+        if market_odds is None or market_odds <= 0:
+            return "Please give a price (e.g. Is $17 for Payne Haas FTS value?) or add live_prices.csv so I can use the best available price."
+        value = compute_value_analysis(pid, stat, season_from, season_to, market_odds)
+        return format_value_response(name, value, season_from, season_to, website=website)
+    elif ("value" in norm_msg or "how much" in norm_msg) and not pq.player_names:
         return "Please specify a player name for value analysis (e.g. Is $17 for Payne Haas FTS value?)."
 
     # Single or few players
