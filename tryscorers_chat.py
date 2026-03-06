@@ -421,6 +421,14 @@ def get_unique_players() -> list[dict[str, Any]]:
     df_full, _, _ = load_data()
     if df_full.empty or "Player" not in df_full.columns or "player_id" not in df_full.columns:
         return []
+    # Only keep players who have played at least 1 game since the start of the 2024 season
+    recent = (
+        df_full[df_full["season"] >= 2024]
+        .groupby("player_id")["Games played"]
+        .sum()
+    )
+    recent_games = recent.to_dict()
+
     # One row per player_id, take first Player name
     players = (
         df_full.groupby("player_id", as_index=False)
@@ -430,7 +438,9 @@ def get_unique_players() -> list[dict[str, Any]]:
     return [
         {"player_id": int(r["player_id"]), "name": str(r["Player"]).strip()}
         for _, r in players.iterrows()
-        if pd.notna(r["Player"]) and str(r["Player"]).strip()
+        if pd.notna(r["Player"])
+        and str(r["Player"]).strip()
+        and int(recent_games.get(int(r["player_id"]), 0)) >= 1
     ]
 
 
@@ -801,8 +811,16 @@ def format_value_response(
 
 
 def get_chat_response(message: str, history: list[dict]) -> str:
-    """Produce full response text (no streaming)."""
+    """Produce full response text (no streaming). Prefer RAG when OPENAI_API_KEY is set; else use rules."""
     load_data()
+    # Prefer RAG when available so answers come from RAG pipeline
+    try:
+        import rag
+        if rag.is_rag_available():
+            return rag.get_rag_response(message, history)
+    except Exception:
+        pass
+    # Rule-based path when RAG not available or failed
     pq = parse_query(message)
     season_from, season_to = resolve_timeframe(pq)
     norm_msg = normalize_text(message)
