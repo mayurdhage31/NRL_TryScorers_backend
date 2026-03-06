@@ -19,6 +19,9 @@ build/
 .env.local
 *.env.local
 
+# RAG vector store (rebuilt via python rag_index.py)
+data/chroma_db/
+
 # IDE / OS
 .idea/
 .vscode/

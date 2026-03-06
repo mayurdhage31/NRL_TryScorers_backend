@@ -814,11 +814,19 @@ def get_chat_response(message: str, history: list[dict]) -> str:
     """Produce full response text (no streaming). Prefer RAG when OPENAI_API_KEY is set; else use rules."""
     load_data()
     # Prefer RAG when available so answers come from RAG pipeline
+    # #region agent log
+    import json as _json, time as _time
+    # #endregion
     try:
         import rag
         if rag.is_rag_available():
             return rag.get_rag_response(message, history)
-    except Exception:
+    except Exception as _e:
+        # #region agent log
+        import traceback as _tb
+        with open('/Users/nakulpednekar/Cursor_projects/NRL_Tryscorers/.cursor/debug-8d4aa8.log', 'a') as _f:
+            _f.write(_json.dumps({"sessionId": "8d4aa8", "hypothesisId": "H-D", "location": "tryscorers_chat.py:get_chat_response:rag_exception", "message": "RAG exception silently caught", "data": {"error": str(_e), "traceback": _tb.format_exc()[-600:]}, "timestamp": int(_time.time() * 1000)}) + '\n')
+        # #endregion
         pass
     # Rule-based path when RAG not available or failed
     pq = parse_query(message)
