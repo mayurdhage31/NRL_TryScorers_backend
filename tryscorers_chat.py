@@ -1,7 +1,7 @@
 """
 NRL tryscorers chatbot: deterministic stats, rankings, value analysis.
 All calculations in code; LLM optional for phrasing only.
-Primary data source: NRL_tryscorers_2020_2025_by_position_minutesbands.csv
+Primary data source: NRL_tryscorers_2020_2026_by_position_minutesbands.csv
 """
 import os
 import re
@@ -24,7 +24,7 @@ else:
 _FULL_CSV = os.path.join(_BASE_DIR, "Nrl_tryscorers_2020_2025_full.csv")
 _PLAYERS_CSV = os.path.join(_BASE_DIR, "NRL Players and Teams.csv")
 _LIVE_PRICES_CSV = os.path.join(_BASE_DIR, "live_prices.csv")
-_MINUTESBANDS_CSV = os.path.join(_BASE_DIR, "NRL_tryscorers_2020_2025_by_position_minutesbands.csv")
+_MINUTESBANDS_CSV = os.path.join(_BASE_DIR, "NRL_tryscorers_2020_2026_by_position_minutesbands.csv")
 
 # Summary CSVs (market-specific): best prices only from these, never fabricate
 _REPO_DATA = os.path.join(os.path.dirname(__file__), "..", "data")
@@ -48,11 +48,16 @@ _available_seasons: list[int] = []
 STAT_2PLUS = "2+"
 STAT_COLUMNS = ["FTS", "ATS", "LTS", "FTS2H", STAT_2PLUS]
 
-# Minutes band constants (broadest first)
-MINUTES_BANDS_ORDERED = ["Over 20 mins", "Over 30 mins", "Over 40 mins", "Over 50 mins", "Over 60 mins", "Over 70 mins"]
+# Minutes band constants (broadest first, excluding "Less than 20 mins" from default ordered list)
+MINUTES_BANDS_ORDERED = ["Less than 20 mins", "Over 20 mins", "Over 30 mins", "Over 40 mins", "Over 50 mins", "Over 60 mins", "Over 70 mins"]
 DEFAULT_MINUTES_BAND = "Over 20 mins"
 
 MINUTES_BAND_ALIASES: dict[str, str] = {
+    "less than 20": "Less than 20 mins",
+    "less than 20 mins": "Less than 20 mins",
+    "under 20": "Less than 20 mins",
+    "under 20 mins": "Less than 20 mins",
+    "sub 20": "Less than 20 mins",
     "over 20": "Over 20 mins",
     "over 20 mins": "Over 20 mins",
     "20 mins": "Over 20 mins",
@@ -212,6 +217,8 @@ def _load_minutesbands_csv() -> pd.DataFrame:
             df["Season"] = pd.to_numeric(df["Season"], errors="coerce").fillna(0).astype(int)
         if "Games played" in df.columns:
             df["Games played"] = pd.to_numeric(df["Games played"], errors="coerce").fillna(0).astype(int)
+        if "Total Games played" in df.columns:
+            df["Total Games played"] = pd.to_numeric(df["Total Games played"], errors="coerce").fillna(0).astype(int)
         for stat in STAT_COLUMNS:
             if stat in df.columns:
                 df[stat] = pd.to_numeric(df[stat], errors="coerce").fillna(0).astype(int)
@@ -608,32 +615,41 @@ def get_player_season_stats_minutesbands(
     if sub.empty:
         return []
 
-    # Apply filters
     band = minutes_band or DEFAULT_MINUTES_BAND
-    sub = sub[sub["Minutes_Band"] == band]
 
     # Positions filter (list of positions)
     active_positions = [p.strip() for p in (positions or []) if p.strip().lower() not in ("", "all")]
+
+    # --- Total Games: deduplicate per Season/Position (any band), then sum across positions ---
+    sub_for_totals = sub.copy()
     if active_positions:
-        sub = sub[sub["Position"].astype(str).str.strip().isin(active_positions)]
-
+        sub_for_totals = sub_for_totals[sub_for_totals["Position"].astype(str).str.strip().isin(active_positions)]
     if seasons:
-        sub = sub[sub["Season"].isin(seasons)]
+        sub_for_totals = sub_for_totals[sub_for_totals["Season"].isin(seasons)]
 
-    def _odds_val(raw: Any) -> float | None:
-        if pd.isna(raw) or str(raw).strip().upper() == "NA" or str(raw).strip() == "":
-            return None
-        try:
-            return round(float(raw), 2)
-        except (TypeError, ValueError):
-            return None
+    has_total_col = "Total Games played" in sub_for_totals.columns
+    if has_total_col and not sub_for_totals.empty:
+        total_games_by_season: dict[int, int] = (
+            sub_for_totals.groupby(["Season", "Position"])["Total Games played"]
+            .first()
+            .reset_index()
+            .groupby("Season")["Total Games played"]
+            .sum()
+            .astype(int)
+            .to_dict()
+        )
+    else:
+        total_games_by_season = {}
+
+    # --- Filtered stats: apply band, positions, seasons ---
+    sub_band = sub[sub["Minutes_Band"] == band]
+    if active_positions:
+        sub_band = sub_band[sub_band["Position"].astype(str).str.strip().isin(active_positions)]
+    if seasons:
+        sub_band = sub_band[sub_band["Season"].isin(seasons)]
 
     def _agg_odds_val(hits: int, gp: int) -> float | None:
         return round(gp / hits, 2) if hits > 0 and gp > 0 else None
-
-    def _fmt_odds(raw: Any) -> str:
-        v = _odds_val(raw)
-        return f"${v:.2f}" if v is not None else "—"
 
     def _agg_fmt(hits: int, gp: int) -> str:
         v = _agg_odds_val(hits, gp)
@@ -645,21 +661,24 @@ def get_player_season_stats_minutesbands(
         group_cols = ["Season", "Position"]
 
     stat_sum_cols = ["Games played", "FTS", "ATS", "LTS", "FTS2H", "2+"]
-    agg_df = sub.groupby(group_cols)[stat_sum_cols].sum().reset_index()
+    agg_df = sub_band.groupby(group_cols)[stat_sum_cols].sum().reset_index()
     agg_df = agg_df.sort_values("Season")
 
     out = []
-    totals: dict[str, int] = {s: 0 for s in ["games_played", "fts", "ats", "lts", "fts2h", "two_plus"]}
+    totals: dict[str, int] = {s: 0 for s in ["games_played", "total_games_played", "fts", "ats", "lts", "fts2h", "two_plus"]}
 
     for _, row in agg_df.iterrows():
+        season_val = int(row["Season"])
         gp = int(row.get("Games played", 0))
         fts = int(row.get("FTS", 0))
         ats = int(row.get("ATS", 0))
         lts = int(row.get("LTS", 0))
         fts2h = int(row.get("FTS2H", 0))
         two_plus = int(row.get("2+", 0))
+        tgp = int(total_games_by_season.get(season_val, 0))
 
         totals["games_played"] += gp
+        totals["total_games_played"] += tgp
         totals["fts"] += fts
         totals["ats"] += ats
         totals["lts"] += lts
@@ -669,10 +688,11 @@ def get_player_season_stats_minutesbands(
         row_position = str(row.get("Position", "All")).strip() if "Position" in agg_df.columns else (", ".join(active_positions) if active_positions else "All")
 
         out.append({
-            "season": int(row["Season"]),
+            "season": season_val,
             "position": row_position,
             "minutes_band": band,
             "games_played": gp,
+            "total_games_played": tgp,
             "fts": fts,
             "fts_historical_odds": _agg_odds_val(fts, gp),
             "fts_odds_fmt": _agg_fmt(fts, gp),
@@ -698,27 +718,28 @@ def get_player_season_stats_minutesbands(
         v = _agg_odds(hits, gp)
         return f"${v:.2f}" if v is not None else "—"
 
-    tgp = totals["games_played"]
+    tgp_total = totals["games_played"]
     out.append({
         "season": "Total",
         "position": ", ".join(active_positions) if active_positions else "All",
         "minutes_band": band,
-        "games_played": tgp,
+        "games_played": tgp_total,
+        "total_games_played": totals["total_games_played"],
         "fts": totals["fts"],
-        "fts_historical_odds": _agg_odds(totals["fts"], tgp),
-        "fts_odds_fmt": _agg_odds_fmt(totals["fts"], tgp),
+        "fts_historical_odds": _agg_odds(totals["fts"], tgp_total),
+        "fts_odds_fmt": _agg_odds_fmt(totals["fts"], tgp_total),
         "ats": totals["ats"],
-        "ats_historical_odds": _agg_odds(totals["ats"], tgp),
-        "ats_odds_fmt": _agg_odds_fmt(totals["ats"], tgp),
+        "ats_historical_odds": _agg_odds(totals["ats"], tgp_total),
+        "ats_odds_fmt": _agg_odds_fmt(totals["ats"], tgp_total),
         "lts": totals["lts"],
-        "lts_historical_odds": _agg_odds(totals["lts"], tgp),
-        "lts_odds_fmt": _agg_odds_fmt(totals["lts"], tgp),
+        "lts_historical_odds": _agg_odds(totals["lts"], tgp_total),
+        "lts_odds_fmt": _agg_odds_fmt(totals["lts"], tgp_total),
         "fts2h": totals["fts2h"],
-        "fts2h_historical_odds": _agg_odds(totals["fts2h"], tgp),
-        "fts2h_odds_fmt": _agg_odds_fmt(totals["fts2h"], tgp),
+        "fts2h_historical_odds": _agg_odds(totals["fts2h"], tgp_total),
+        "fts2h_odds_fmt": _agg_odds_fmt(totals["fts2h"], tgp_total),
         "two_plus": totals["two_plus"],
-        "two_plus_historical_odds": _agg_odds(totals["two_plus"], tgp),
-        "two_plus_odds_fmt": _agg_odds_fmt(totals["two_plus"], tgp),
+        "two_plus_historical_odds": _agg_odds(totals["two_plus"], tgp_total),
+        "two_plus_odds_fmt": _agg_odds_fmt(totals["two_plus"], tgp_total),
     })
 
     return out
@@ -935,8 +956,9 @@ def _fmt_season_bullet(
     gp: int,
     hits: int,
     odds_raw: Any,
+    total_gp: int | None = None,
 ) -> str:
-    """Build one bullet line: • 2023 — GP 22 | ATS 7/22 (31.82%, $3.14)"""
+    """Build one bullet line: • 2023 — GP 20/24 | ATS 7/20 (35.0%, $2.86)"""
     pct = (hits / gp * 100) if gp else 0.0
     if pd.isna(odds_raw) or str(odds_raw).strip().upper() == "NA" or str(odds_raw).strip() == "":
         odds_str = "—"
@@ -945,7 +967,8 @@ def _fmt_season_bullet(
             odds_str = f"${float(odds_raw):.2f}"
         except (TypeError, ValueError):
             odds_str = "—"
-    return f"• {season_label} — GP {gp} | {stat_type} {hits}/{gp} ({pct:.2f}%, {odds_str})"
+    gp_str = f"{gp}/{total_gp}" if total_gp is not None and total_gp > 0 else str(gp)
+    return f"• {season_label} — GP {gp_str} | {stat_type} {hits}/{gp} ({pct:.1f}%, {odds_str})"
 
 
 def format_single_player_response(
@@ -985,6 +1008,25 @@ def format_single_player_response(
         ]
 
         if not player_rows.empty:
+            # Build total_games_by_season (ignoring band, across the positions already filtered)
+            all_pos_rows = mb_df[mb_df["Player"].astype(str).str.strip() == player_name.strip()].copy()
+            if position and position.strip().lower() not in ("", "all"):
+                all_pos_rows = all_pos_rows[all_pos_rows["Position"].astype(str).str.strip() == position.strip()]
+            all_pos_rows = all_pos_rows[
+                (all_pos_rows["Season"] >= season_from) & (all_pos_rows["Season"] <= season_to)
+            ]
+            total_games_map: dict[int, int] = {}
+            if "Total Games played" in all_pos_rows.columns and not all_pos_rows.empty:
+                total_games_map = (
+                    all_pos_rows.groupby(["Season", "Position"])["Total Games played"]
+                    .first()
+                    .reset_index()
+                    .groupby("Season")["Total Games played"]
+                    .sum()
+                    .astype(int)
+                    .to_dict()
+                )
+
             # Aggregate multiple positions within the same season
             agg = player_rows.groupby("Season")[["Games played", stat_type]].sum().reset_index()
             agg = agg.sort_values("Season")
@@ -992,16 +1034,19 @@ def format_single_player_response(
             lines = [header, ""]
             total_gp = 0
             total_hits = 0
+            total_all_games = 0
             for _, row in agg.iterrows():
+                season_int = int(row["Season"])
                 gp = int(row.get("Games played", 0))
                 hits = int(pd.to_numeric(row.get(stat_type, 0), errors="coerce") or 0)
-                # Compute historical odds from aggregated hits/gp
+                tgp = total_games_map.get(season_int)
                 odds_raw = (gp / hits) if hits > 0 else None
-                lines.append(_fmt_season_bullet(str(int(row["Season"])), stat_type, gp, hits, odds_raw))
+                lines.append(_fmt_season_bullet(str(season_int), stat_type, gp, hits, odds_raw, total_gp=tgp))
                 total_gp += gp
                 total_hits += hits
+                total_all_games += tgp if tgp is not None else gp
             total_odds_raw = (total_gp / total_hits) if total_hits else None
-            lines.append(_fmt_season_bullet("Total", stat_type, total_gp, total_hits, total_odds_raw))
+            lines.append(_fmt_season_bullet("Total", stat_type, total_gp, total_hits, total_odds_raw, total_gp=total_all_games if total_all_games else None))
             return "\n".join(lines)
 
     # Fallback: aggregate from full CSV

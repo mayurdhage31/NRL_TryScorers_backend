@@ -26,7 +26,7 @@ STORE_STATE_PATH = os.path.join(_DATA_DIR, "file_search_store.json")
 STORE_DISPLAY_NAME = "nrl_tryscorers"
 
 # Primary store (minutes-bands dataset)
-MINUTESBANDS_CSV = os.path.join(_DATA_DIR, "NRL_tryscorers_2020_2025_by_position_minutesbands.csv")
+MINUTESBANDS_CSV = os.path.join(_DATA_DIR, "NRL_tryscorers_2020_2026_by_position_minutesbands.csv")
 MINUTESBANDS_STORE_STATE_PATH = os.path.join(_DATA_DIR, "file_search_store_minutesbands.json")
 MINUTESBANDS_STORE_DISPLAY_NAME = "nrl_tryscorers_minutesbands"
 
