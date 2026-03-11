@@ -140,7 +140,7 @@ def player_positions(player_id: int):
 @app.get("/api/players/{player_id}/seasons")
 def player_seasons(
     player_id: int,
-    minutes_band: Optional[str] = Query(default=None, description="e.g. 'Over 20 mins' (default: broadest band)"),
+    minutes_band: Optional[list[str]] = Query(default=None, description="e.g. minutes_band=Over+20+mins&minutes_band=Over+30+mins (multiple allowed; default: Over 20 mins)"),
     positions: Optional[list[str]] = Query(default=None, description="Position filters, e.g. positions=Prop&positions=Lock. Omit for all."),
     seasons: Optional[list[int]] = Query(default=None, description="Season years to include, e.g. seasons=2023&seasons=2024"),
 ):
@@ -155,7 +155,7 @@ def player_seasons(
 
     rows = chat.get_player_season_stats_minutesbands(
         player_id=player_id,
-        minutes_band=minutes_band,
+        minutes_bands=list(minutes_band) if minutes_band else None,
         positions=list(positions) if positions else None,
         seasons=list(seasons) if seasons else None,
     )
