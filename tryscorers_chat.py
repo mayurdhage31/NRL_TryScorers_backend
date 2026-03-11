@@ -588,7 +588,7 @@ def get_player_positions(player_id: int) -> list[str] | None:
 
 def get_player_season_stats_minutesbands(
     player_id: int,
-    minutes_band: str | None = None,
+    minutes_bands: list[str] | None = None,
     positions: list[str] | None = None,
     seasons: list[int] | None = None,
 ) -> list[dict[str, Any]]:
@@ -596,8 +596,8 @@ def get_player_season_stats_minutesbands(
     Return per-season stats from the minutes-bands CSV, plus a Total row.
 
     Looks up player name via player_id from the full CSV, then filters
-    the minutes-bands CSV by name, minutes_band, positions, and seasons.
-    When multiple positions are provided, stats are aggregated across all of them.
+    the minutes-bands CSV by name, minutes_bands, positions, and seasons.
+    When multiple bands or positions are provided, stats are aggregated across all of them.
     """
     df_full, _, _ = load_data()
     mb_df = _get_minutesbands()
@@ -615,7 +615,10 @@ def get_player_season_stats_minutesbands(
     if sub.empty:
         return []
 
-    band = minutes_band or DEFAULT_MINUTES_BAND
+    active_bands = [b.strip() for b in (minutes_bands or []) if b.strip()]
+    if not active_bands:
+        active_bands = [DEFAULT_MINUTES_BAND]
+    band = ", ".join(active_bands)
 
     # Positions filter (list of positions)
     active_positions = [p.strip() for p in (positions or []) if p.strip().lower() not in ("", "all")]
@@ -641,8 +644,8 @@ def get_player_season_stats_minutesbands(
     else:
         total_games_by_season = {}
 
-    # --- Filtered stats: apply band, positions, seasons ---
-    sub_band = sub[sub["Minutes_Band"] == band]
+    # --- Filtered stats: apply band(s), positions, seasons ---
+    sub_band = sub[sub["Minutes_Band"].isin(active_bands)]
     if active_positions:
         sub_band = sub_band[sub_band["Position"].astype(str).str.strip().isin(active_positions)]
     if seasons:
