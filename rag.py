@@ -25,10 +25,10 @@ _minutesbands_index_ready: bool = False
 STORE_STATE_PATH = os.path.join(_DATA_DIR, "file_search_store.json")
 STORE_DISPLAY_NAME = "nrl_tryscorers"
 
-# Primary store (minutes-bands dataset)
+# Primary store (minutes-bands dataset + bookmaker prices)
 MINUTESBANDS_CSV = os.path.join(_DATA_DIR, "NRL_tryscorers_2020_2026_by_position_minutesbands.csv")
-MINUTESBANDS_STORE_STATE_PATH = os.path.join(_DATA_DIR, "file_search_store_minutesbands.json")
-MINUTESBANDS_STORE_DISPLAY_NAME = "nrl_tryscorers_minutesbands"
+MINUTESBANDS_STORE_STATE_PATH = os.path.join(_DATA_DIR, "file_search_store_minutesbands_v2.json")
+MINUTESBANDS_STORE_DISPLAY_NAME = "nrl_tryscorers_v2"
 
 GEMINI_MODEL = "gemini-2.5-flash"
 
@@ -43,11 +43,24 @@ DATASET CONTEXT:
   FTS2H (First Try 2nd Half), 2+ (two or more tries).
 - Historical odds = Games played / hits (e.g. 22 GP, 7 ATS → $3.14).
 
+BOOKMAKER PRICES:
+- Current-round bookmaker prices are available for FTS, ATS, LTS, FTS2H, and 2+ markets.
+- Bookmakers: Tab, Neds, Betright, Bet365, Sportsbet, Pointsbet, Dabble, Playup, Boombet, Bluebet, Unibet.
+- The "Best price" field shows the highest (best) price across all bookmakers for that player/market.
+- For questions about bookmaker prices, best prices, or which bookmaker to use, look for
+  "Bookmaker prices this round" entries in the context.
+
 RESPONSE FORMATTING RULES (always follow — never use "***" or "**"):
 Single player stats:
   {Player} — {stat} stats ({filters})
   • {season} — GP {n} | {stat} {hits}/{gp} ({pct}%, ${odds})
   • Total — GP {n} | {stat} {hits}/{gp} ({pct}%, ${odds})
+
+Bookmaker price questions:
+  {Player} — {market} bookmaker prices this round:
+  Best price: ${best_price} on {best_bookmaker}
+  All bookmakers:
+  • {Bookmaker}: ${price}
 
 Value questions (3 bullets):
   {Player} — {stat} value check ({filters})
@@ -110,6 +123,46 @@ def build_chunks():
                 pass
             parts.append(f" {col}: {val}")
         yield "".join(parts)
+
+
+def build_chunks_summary_prices():
+    """Yield text chunks of current-round bookmaker prices from all summary CSVs."""
+    import tryscorers_chat as chat
+    price_cols = sorted(chat._PRICE_COLUMNS)
+    for market, filenames in chat._SUMMARY_CSV.items():
+        for base in (chat._BASE_DIR, os.path.join(os.path.dirname(__file__), "..", "data")):
+            path = os.path.join(base, filenames[0])
+            if not os.path.isfile(path):
+                continue
+            try:
+                df = pd.read_csv(path)
+                df.columns = [str(c).strip() for c in df.columns]
+                if "Player" not in df.columns:
+                    break
+                for _, row in df.iterrows():
+                    player = str(row.get("Player", "")).strip()
+                    if not player:
+                        continue
+                    parts = [f"Player: {player} | Market: {market} | Bookmaker prices this round:"]
+                    for col in price_cols:
+                        if col in df.columns:
+                            v = row.get(col)
+                            if pd.notna(v) and str(v).strip() not in ("", "NA"):
+                                try:
+                                    parts.append(f" | {col}: ${float(v):.2f}")
+                                except (TypeError, ValueError):
+                                    pass
+                    highest = row.get("Highest")
+                    if pd.notna(highest) and str(highest).strip() not in ("", "NA"):
+                        try:
+                            parts.append(f" | Best price: ${float(highest):.2f}")
+                        except (TypeError, ValueError):
+                            pass
+                    if len(parts) > 1:
+                        yield "".join(parts)
+                break
+            except Exception as exc:
+                print(f"[RAG] Failed to build price chunks for {market}: {exc}")
 
 
 def build_chunks_minutesbands():
@@ -261,8 +314,14 @@ def _get_legacy_store_name() -> str:
 # Primary store (minutes-bands dataset)
 # ---------------------------------------------------------------------------
 
+def _build_chunks_combined():
+    """Yield all chunks: historical stats (minutes-bands) + bookmaker prices (summary CSVs)."""
+    yield from build_chunks_minutesbands()
+    yield from build_chunks_summary_prices()
+
+
 def ensure_minutesbands_index() -> int:
-    """Build or refresh the minutes-bands Gemini File Search store. Idempotent."""
+    """Build or refresh the combined Gemini File Search store (stats + prices). Idempotent."""
     client = _get_client()
     store_name = _load_store_name(MINUTESBANDS_STORE_STATE_PATH)
     if store_name and _store_exists(client, store_name):
@@ -270,8 +329,8 @@ def ensure_minutesbands_index() -> int:
     return _build_and_upload_store(
         client,
         MINUTESBANDS_STORE_DISPLAY_NAME,
-        build_chunks_minutesbands(),
-        "nrl_tryscorers_minutesbands_stats",
+        _build_chunks_combined(),
+        "nrl_tryscorers_combined_stats",
         MINUTESBANDS_STORE_STATE_PATH,
     )
 

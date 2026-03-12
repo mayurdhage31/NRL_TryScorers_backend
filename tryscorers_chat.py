@@ -139,17 +139,28 @@ STAT_ALIASES = {
     "fts": "FTS",
     "first try scorer": "FTS",
     "first tryscorer": "FTS",
+    "score first": "FTS",
+    "first scorer": "FTS",
+    "to score first": "FTS",
+    "score the first": "FTS",
+    "first try": "FTS",
     "ats": "ATS",
     "anytime try scorer": "ATS",
     "anytime tryscorer": "ATS",
+    "anytime scorer": "ATS",
+    "score a try": "ATS",
     "lts": "LTS",
     "last try scorer": "LTS",
     "last tryscorer": "LTS",
+    "score last": "LTS",
+    "last scorer": "LTS",
+    "to score last": "LTS",
     "fts2h": "FTS2H",
     "first try scorer 2nd half": "FTS2H",
     "first try scorer second half": "FTS2H",
     "first try in second half": "FTS2H",
     "first 2nd half tryscorer": "FTS2H",
+    "first try 2nd half": "FTS2H",
     "2+": STAT_2PLUS,
     "2+ tries": STAT_2PLUS,
     "two or more tries": STAT_2PLUS,
@@ -358,12 +369,18 @@ def parse_query(message: str) -> ParsedQuery:
     # Player names
     pq.player_names = resolve_player_names(message, norm)
 
-    # Best available price
-    if re.search(r"best\s+(available\s+)?price", norm) or re.search(r"price[s]?\s+for\s+.+\s+(fts|ats|lts|fts2h|2\+)", norm):
+    # Best available price — broad detection
+    if re.search(r"best\s+(available\s+)?price", norm):
         pq.best_price_request = True
-    if pq.stat_type and pq.player_names and ("price" in norm or "odds" in norm):
-        if re.search(r"(what|best|available|current)\s+(is\s+)?(the\s+)?(best\s+)?(price|odds)", norm):
-            pq.best_price_request = True
+    if re.search(r"price[s]?\s+for\s+.+\s+(fts|ats|lts|fts2h|2\+)", norm):
+        pq.best_price_request = True
+    if re.search(r"\b(bookmaker|bookie|bookies|which\s+book)\b", norm):
+        pq.best_price_request = True
+    if re.search(r"(what|best|available|current)\s+(is\s+)?(the\s+)?(best\s+)?(price|odds)", norm):
+        pq.best_price_request = True
+    # Any message with a player name + price/odds keyword is a price request
+    if pq.player_names and re.search(r"\b(price|odds|paying|payout)\b", norm):
+        pq.best_price_request = True
 
     return pq
 
@@ -410,7 +427,7 @@ def resolve_positions(norm_text: str) -> list[str]:
 
 
 def resolve_player_names(message: str, norm_text: str) -> list[str]:
-    """Match player names from message against data."""
+    """Match player names from message against data. Falls back to last-name matching."""
     df_full, df_players, _ = load_data()
     all_names = set()
     if "Player" in df_full.columns:
@@ -418,6 +435,7 @@ def resolve_player_names(message: str, norm_text: str) -> list[str]:
     if not df_players.empty and "Player" in df_players.columns:
         all_names.update(df_players["Player"].dropna().astype(str).unique())
 
+    # Primary pass: match full player name
     candidates = []
     for name in all_names:
         name_clean = name.strip()
@@ -432,6 +450,30 @@ def resolve_player_names(message: str, norm_text: str) -> list[str]:
         if name not in seen and not any(name in s and name != s for s in seen):
             seen.add(name)
             result.append(name)
+
+    # Secondary pass: match by last name only (unambiguous, non-keyword matches only)
+    _SKIP_WORDS = {
+        "the", "for", "and", "with", "from", "this", "that", "what", "who", "how",
+        "best", "last", "first", "next", "over", "under", "round", "game", "games",
+        "try", "tries", "score", "scorer", "price", "odds", "rate", "stats", "stat",
+        "season", "seasons", "year", "years", "team", "position", "player", "players",
+        "bookmaker", "bookmakers", "available", "current", "historical", "total",
+        "fts", "ats", "lts", "fts2h", "2plus", "more", "half", "match", "week",
+    }
+    if not result:
+        last_name_map: dict[str, list[str]] = {}
+        for name in all_names:
+            parts = name.strip().split()
+            if len(parts) >= 2:
+                last = parts[-1].lower()
+                last_name_map.setdefault(last, []).append(name.strip())
+        for word in re.findall(r'\b[A-Za-z]{3,}\b', message):
+            if word.lower() in _SKIP_WORDS:
+                continue
+            matches = last_name_map.get(word.lower(), [])
+            if len(matches) == 1 and matches[0] not in result:
+                result.append(matches[0])
+
     return result[:10]
 
 
@@ -832,13 +874,20 @@ def _get_best_price_for_value(player_name: str, market: str) -> tuple[float | No
 def format_best_prices_response(player_name: str, market: str, offers: list[dict[str, Any]]) -> str:
     if not offers:
         return (
-            f"No price data available for {player_name} {market} in the current data. "
-            "Prices are only taken from the summary CSVs (e.g. fts_summary.csv, lts_summary.csv); "
-            "if this player/market is not listed there, we cannot show a price."
+            f"No price data available for {player_name} {market} this round. "
+            "The player may not be listed in the current round's markets."
         )
-    lines = [f"Best available prices for {player_name} {market}:", ""]
+    best = offers[0]
+    lines = [
+        f"{player_name} — {market} bookmaker prices this round:",
+        "",
+        f"Best price: ${best['price']:.2f} on {best['website']}",
+        "",
+        "All bookmakers:",
+    ]
     for o in offers:
-        lines.append(f"• ${o['price']:.2f} on {o['website']}")
+        marker = " ◄ best" if o["website"] == best["website"] and o["price"] == best["price"] else ""
+        lines.append(f"• {o['website']}: ${o['price']:.2f}{marker}")
     return "\n".join(lines)
 
 
@@ -1158,26 +1207,16 @@ def format_value_response(
     return "\n".join(lines)
 
 
-def get_chat_response(message: str, history: list[dict]) -> str:
-    """Produce full response text. Prefer RAG when GEMINI_API_KEY is set; else use rules."""
-    load_data()
-    try:
-        import rag
-        if rag.is_rag_available():
-            return rag.get_rag_response(message, history)
-    except Exception:
-        pass
-
-    # Rule-based path
-    pq = parse_query(message)
+def _rule_based_response(pq: "ParsedQuery", message: str) -> str:
+    """Run the deterministic rule-based logic given a pre-parsed query."""
     season_from, season_to = resolve_timeframe(pq)
     norm_msg = normalize_text(message)
-    mb = pq.minutes_band  # may be None (caller will default to Over 20 mins in formatters)
+    mb = pq.minutes_band
 
-    # Best available price
-    if pq.best_price_request and pq.player_names and pq.stat_type:
+    # Best available price — always deterministic
+    if pq.best_price_request and pq.player_names:
         name = pq.player_names[0]
-        stat = pq.stat_type or "ATS"
+        stat = pq.stat_type or "FTS"
         offers = get_live_prices(name, stat)
         return format_best_prices_response(name, stat, offers)
 
@@ -1252,6 +1291,30 @@ def get_chat_response(message: str, history: list[dict]) -> str:
                 pq.positions, min_g, min_2024, min_pct, minutes_band=mb,
             )
     return "Please ask about a specific player, a ranking (e.g. top 5 edge forwards for LTS since 2022), or a value question (e.g. Is $17 for Payne Haas FTS value?)."
+
+
+def get_chat_response(message: str, history: list[dict]) -> str:
+    """Produce full response text. Price/bookmaker questions always handled deterministically."""
+    load_data()
+    pq = parse_query(message)
+
+    # Always handle price/bookmaker requests deterministically — never delegate to RAG
+    if pq.best_price_request and pq.player_names:
+        name = pq.player_names[0]
+        stat = pq.stat_type or "FTS"
+        offers = get_live_prices(name, stat)
+        return format_best_prices_response(name, stat, offers)
+
+    # For non-price questions, prefer RAG when available
+    try:
+        import rag
+        if rag.is_rag_available():
+            return rag.get_rag_response(message, history)
+    except Exception:
+        pass
+
+    # Rule-based fallback (reuse already-parsed query)
+    return _rule_based_response(pq, message)
 
 
 def stream_chat_response(message: str, history: list[dict]):
