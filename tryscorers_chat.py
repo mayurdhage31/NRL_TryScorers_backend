@@ -260,6 +260,7 @@ def normalize_text(s: str) -> str:
 @dataclass
 class ParsedQuery:
     player_names: list[str] = field(default_factory=list)
+    ambiguous_name_map: dict[str, list[str]] = field(default_factory=dict)
     stat_type: str | None = None
     season_from: int | None = None
     season_to: int | None = None
@@ -366,8 +367,8 @@ def parse_query(message: str) -> ParsedQuery:
                 if odds:
                     pq.market_odds = float(odds.group(1))
 
-    # Player names
-    pq.player_names = resolve_player_names(message, norm)
+    # Player names (also captures ambiguous partial-name matches)
+    pq.player_names, pq.ambiguous_name_map = resolve_player_names(message, norm)
 
     # Best available price — broad detection
     if re.search(r"best\s+(available\s+)?price", norm):
@@ -426,32 +427,30 @@ def resolve_positions(norm_text: str) -> list[str]:
     return list(out)
 
 
-def resolve_player_names(message: str, norm_text: str) -> list[str]:
-    """Match player names from message against data. Falls back to last-name matching."""
+def resolve_player_names(message: str, norm_text: str) -> tuple[list[str], dict[str, list[str]]]:
+    """Match player names from message against dataset.
+
+    Returns (resolved, ambiguous_map):
+      resolved      — unambiguous full player names.
+      ambiguous_map — {partial_word: [candidate_full_names]} for words that matched
+                      multiple players so the caller can ask for disambiguation.
+
+    Resolution passes (in order):
+      1. Full-name substring match  — silent, takes priority.
+      2. Exact last-name match      — silent if unique, disambiguate if multiple.
+      3. Exact first-name match     — silent if unique, disambiguate if multiple.
+      4. Fuzzy (typo) match         — difflib against all first/last names; silent if
+                                      one clear winner, disambiguate if several.
+    """
+    import difflib
+
     df_full, df_players, _ = load_data()
-    all_names = set()
+    all_names: set[str] = set()
     if "Player" in df_full.columns:
         all_names.update(df_full["Player"].dropna().astype(str).unique())
     if not df_players.empty and "Player" in df_players.columns:
         all_names.update(df_players["Player"].dropna().astype(str).unique())
 
-    # Primary pass: match full player name
-    candidates = []
-    for name in all_names:
-        name_clean = name.strip()
-        if len(name_clean) < 3:
-            continue
-        if re.search(re.escape(name_clean), message, re.I):
-            candidates.append((name_clean, len(name_clean)))
-    candidates.sort(key=lambda x: -x[1])
-    seen = set()
-    result = []
-    for name, _ in candidates:
-        if name not in seen and not any(name in s and name != s for s in seen):
-            seen.add(name)
-            result.append(name)
-
-    # Secondary pass: match by last name only (unambiguous, non-keyword matches only)
     _SKIP_WORDS = {
         "the", "for", "and", "with", "from", "this", "that", "what", "who", "how",
         "best", "last", "first", "next", "over", "under", "round", "game", "games",
@@ -459,22 +458,99 @@ def resolve_player_names(message: str, norm_text: str) -> list[str]:
         "season", "seasons", "year", "years", "team", "position", "player", "players",
         "bookmaker", "bookmakers", "available", "current", "historical", "total",
         "fts", "ats", "lts", "fts2h", "2plus", "more", "half", "match", "week",
+        "give", "show", "tell", "record", "records", "since", "into", "when", "been",
+        "have", "does", "data", "info", "check", "look", "find",
     }
-    if not result:
-        last_name_map: dict[str, list[str]] = {}
-        for name in all_names:
-            parts = name.strip().split()
-            if len(parts) >= 2:
-                last = parts[-1].lower()
-                last_name_map.setdefault(last, []).append(name.strip())
-        for word in re.findall(r'\b[A-Za-z]{3,}\b', message):
-            if word.lower() in _SKIP_WORDS:
-                continue
-            matches = last_name_map.get(word.lower(), [])
-            if len(matches) == 1 and matches[0] not in result:
-                result.append(matches[0])
 
-    return result[:10]
+    # ------------------------------------------------------------------
+    # Pass 1: full-name substring match (case-insensitive)
+    # ------------------------------------------------------------------
+    candidates: list[tuple[str, int]] = []
+    for name in all_names:
+        name_clean = name.strip()
+        if len(name_clean) < 3:
+            continue
+        if re.search(re.escape(name_clean), message, re.I):
+            candidates.append((name_clean, len(name_clean)))
+    candidates.sort(key=lambda x: -x[1])
+    seen: set[str] = set()
+    result: list[str] = []
+    for name, _ in candidates:
+        if name not in seen and not any(name in s and name != s for s in seen):
+            seen.add(name)
+            result.append(name)
+
+    if result:
+        return result[:10], {}
+
+    # ------------------------------------------------------------------
+    # Build first/last name maps for partial matching
+    # ------------------------------------------------------------------
+    last_name_map: dict[str, list[str]] = {}
+    first_name_map: dict[str, list[str]] = {}
+    for name in all_names:
+        parts = name.strip().split()
+        if len(parts) >= 2:
+            last_name_map.setdefault(parts[-1].lower(), []).append(name.strip())
+            first_name_map.setdefault(parts[0].lower(), []).append(name.strip())
+
+    all_last_names = list(last_name_map.keys())
+    all_first_names = list(first_name_map.keys())
+
+    ambiguous_map: dict[str, list[str]] = {}
+    words = re.findall(r'\b[A-Za-z]{3,}\b', message)
+
+    for word in words:
+        wl = word.lower()
+        if wl in _SKIP_WORDS:
+            continue
+
+        # Pass 2: exact last-name
+        last_matches = last_name_map.get(wl, [])
+        if len(last_matches) == 1:
+            if last_matches[0] not in result:
+                result.append(last_matches[0])
+            continue
+        if len(last_matches) > 1:
+            ambiguous_map[word] = sorted(set(last_matches))[:10]
+            continue
+
+        # Pass 3: exact first-name
+        first_matches = first_name_map.get(wl, [])
+        if len(first_matches) == 1:
+            if first_matches[0] not in result:
+                result.append(first_matches[0])
+            continue
+        if len(first_matches) > 1:
+            ambiguous_map[word] = sorted(set(first_matches))[:10]
+            continue
+
+        # Pass 4: fuzzy typo correction (only when no exact match at all)
+        fuzzy_candidates: list[str] = []
+        for fl in difflib.get_close_matches(wl, all_last_names, n=5, cutoff=0.75):
+            fuzzy_candidates.extend(last_name_map[fl])
+        for ff in difflib.get_close_matches(wl, all_first_names, n=5, cutoff=0.75):
+            fuzzy_candidates.extend(first_name_map[ff])
+        # Deduplicate while preserving order
+        seen_fuzzy: set[str] = set()
+        deduped: list[str] = []
+        for fc in fuzzy_candidates:
+            if fc not in seen_fuzzy:
+                seen_fuzzy.add(fc)
+                deduped.append(fc)
+
+        if len(deduped) == 1:
+            if deduped[0] not in result:
+                result.append(deduped[0])
+        elif len(deduped) > 1:
+            ambiguous_map[word] = deduped[:10]
+
+    # If we resolved at least one name via partial/fuzzy matching, suppress the
+    # ambiguous map — the resolved name(s) are sufficient to answer.
+    if result:
+        return result[:10], {}
+
+    return [], ambiguous_map
 
 
 def resolve_top_n(pq: ParsedQuery) -> int:
@@ -1293,10 +1369,26 @@ def _rule_based_response(pq: "ParsedQuery", message: str) -> str:
     return "Please ask about a specific player, a ranking (e.g. top 5 edge forwards for LTS since 2022), or a value question (e.g. Is $17 for Payne Haas FTS value?)."
 
 
+def _build_disambiguation_message(ambiguous_map: dict[str, list[str]]) -> str:
+    """Return a numbered disambiguation prompt for the first ambiguous partial name found."""
+    partial, candidates = next(iter(ambiguous_map.items()))
+    lines = [
+        f"I found multiple players matching '{partial}'. Which one did you mean?",
+    ]
+    for i, name in enumerate(candidates, 1):
+        lines.append(f"{i}) {name}")
+    lines.append("Please re-ask using the full name from the list above.")
+    return "\n".join(lines)
+
+
 def get_chat_response(message: str, history: list[dict]) -> str:
     """Produce full response text. Price/bookmaker questions always handled deterministically."""
     load_data()
     pq = parse_query(message)
+
+    # Disambiguation takes priority — ask user to clarify before doing anything else
+    if pq.ambiguous_name_map and not pq.player_names:
+        return _build_disambiguation_message(pq.ambiguous_name_map)
 
     # Always handle price/bookmaker requests deterministically — never delegate to RAG
     if pq.best_price_request and pq.player_names:
