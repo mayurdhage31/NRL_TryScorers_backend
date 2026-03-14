@@ -169,6 +169,28 @@ STAT_ALIASES = {
     "multi-try": STAT_2PLUS,
 }
 
+# Known player nicknames that fuzzy/partial matching can't reliably resolve.
+# Keys are lowercase; values are exact player names as they appear in the dataset.
+NICKNAME_MAP: dict[str, str] = {
+    "luki": "Luciano Leilua",
+    "turbo": "Tom Trbojevic",
+    "haasy": "Payne Haas",
+    "teddy": "James Tedesco",
+    "jimmy": "James Tedesco",
+}
+
+# Conversational prefixes to strip before player/stat extraction so that
+# phrases like "I want to bet on Haas FTS" resolve the player name cleanly.
+_INTENT_PREFIXES = [
+    r"i want to bet on\s+",
+    r"i wanna bet on\s+",
+    r"wheres?\s+(the\s+)?best\s+price\s+(for\s+)?",
+    r"where\s+is\s+(the\s+)?best\s+price\s+(for\s+)?",
+    r"should\s+i\s+(back|bet\s+on)\s+",
+    r"can\s+i\s+get\s+(a\s+)?price\s+(for\s+)?",
+    r"what\s+(are\s+the\s+)?odds\s+(for\s+)?",
+]
+
 
 def load_data() -> tuple[pd.DataFrame, pd.DataFrame, list[int]]:
     """Load full tryscorers CSV and players/teams CSV; return (df_full, df_players, seasons)."""
@@ -272,13 +294,28 @@ class ParsedQuery:
     minutes_band: str | None = None
     market_odds: float | None = None
     best_price_request: bool = False
+    bet_analysis_request: bool = False
+    round_value_request: bool = False
     raw_message: str = ""
+
+
+def _strip_intent_prefixes(text: str) -> str:
+    """Remove conversational leading phrases so player/stat parsing is cleaner."""
+    t = text
+    for pattern in _INTENT_PREFIXES:
+        t = re.sub(r"(?i)^" + pattern, "", t).strip()
+    return t
 
 
 def parse_query(message: str) -> ParsedQuery:
     """Extract intent from user message (rule-based + regex)."""
     load_data()
+    # norm is used for intent detection (timeframe, stat type, best_price flags, etc.)
+    # and must be based on the original message so keywords like "best price" are preserved.
     norm = normalize_text(message)
+    # clean_message strips conversational prefixes so player names embedded in
+    # phrases like "I want to bet on Haas FTS" can be extracted cleanly.
+    clean_message = _strip_intent_prefixes(message)
     pq = ParsedQuery(raw_message=message)
 
     # Timeframe
@@ -368,7 +405,9 @@ def parse_query(message: str) -> ParsedQuery:
                     pq.market_odds = float(odds.group(1))
 
     # Player names (also captures ambiguous partial-name matches)
-    pq.player_names, pq.ambiguous_name_map = resolve_player_names(message, norm)
+    # Use the prefix-stripped clean_message for better player name extraction
+    norm_clean = normalize_text(clean_message)
+    pq.player_names, pq.ambiguous_name_map = resolve_player_names(clean_message, norm_clean)
 
     # Best available price — broad detection
     if re.search(r"best\s+(available\s+)?price", norm):
@@ -382,6 +421,23 @@ def parse_query(message: str) -> ParsedQuery:
     # Any message with a player name + price/odds keyword is a price request
     if pq.player_names and re.search(r"\b(price|odds|paying|payout)\b", norm):
         pq.best_price_request = True
+
+    # Combined bet analysis — player + price intent + value/quality language
+    _good_bet_pattern = r"\b(good\s+bet|worth\s+(a\s+)?(bet|punt|backing?)|is\s+it\s+(good|worth|value)|should\s+i\s+bet|worth\s+betting)\b"
+    if re.search(_good_bet_pattern, norm):
+        pq.bet_analysis_request = True
+    # "is it value?" + best_price_request together implies combined analysis
+    if pq.best_price_request and re.search(r"\b(value|worth|good)\b", norm):
+        pq.bet_analysis_request = True
+
+    # Round value bets intent — no specific player required.
+    # Match patterns like "best value ATS bets this round", "value bets", "who's value this round"
+    if re.search(r"\b(value\s+\w*\s*bets?|best\s+value\s+\w*\s*bets?|who.?s\s+(the\s+)?(best\s+)?value|value\s+picks?)\b", norm):
+        pq.round_value_request = True
+    if re.search(r"\bvalue\s+bets?\b", norm):
+        pq.round_value_request = True
+    if re.search(r"\bwho\s+is\s+(the\s+)?(best\s+)?value\b", norm):
+        pq.round_value_request = True
 
     return pq
 
@@ -436,6 +492,7 @@ def resolve_player_names(message: str, norm_text: str) -> tuple[list[str], dict[
                       multiple players so the caller can ask for disambiguation.
 
     Resolution passes (in order):
+      0. Nickname map               — exact lookup in NICKNAME_MAP; silent, highest priority.
       1. Full-name substring match  — silent, takes priority.
       2. Exact last-name match      — silent if unique, disambiguate if multiple.
       3. Exact first-name match     — silent if unique, disambiguate if multiple.
@@ -460,7 +517,24 @@ def resolve_player_names(message: str, norm_text: str) -> tuple[list[str], dict[
         "fts", "ats", "lts", "fts2h", "2plus", "more", "half", "match", "week",
         "give", "show", "tell", "record", "records", "since", "into", "when", "been",
         "have", "does", "data", "info", "check", "look", "find",
+        # Bet/value query words that fuzzy-match player names
+        "value", "values", "bet", "bets", "betting", "back", "backing",
+        "good", "great", "want", "wanna", "should", "worth", "punt",
+        "pick", "picks", "play", "plays", "tip", "tips",
+        "where", "wheres", "which", "there", "their", "about",
     }
+
+    # ------------------------------------------------------------------
+    # Pass 0: nickname map — highest priority, checked before all other passes
+    # ------------------------------------------------------------------
+    nickname_result: list[str] = []
+    words_in_msg = re.findall(r'\b[A-Za-z]{3,}\b', message)
+    for word in words_in_msg:
+        resolved_nick = NICKNAME_MAP.get(word.lower())
+        if resolved_nick and resolved_nick in all_names and resolved_nick not in nickname_result:
+            nickname_result.append(resolved_nick)
+    if nickname_result:
+        return nickname_result[:10], {}
 
     # ------------------------------------------------------------------
     # Pass 1: full-name substring match (case-insensitive)
@@ -1099,6 +1173,15 @@ def _fmt_season_bullet(
     return f"• {season_label} — GP {gp_str} | {stat_type} {hits}/{gp} ({pct:.1f}%, {odds_str})"
 
 
+def _data_range_footer() -> str:
+    """Return a one-line string describing the dataset's season coverage."""
+    load_data()
+    if _available_seasons:
+        lo, hi = min(_available_seasons), max(_available_seasons)
+        return f"Data covers {lo}–{hi} NRL seasons."
+    return "Data covers all available NRL seasons."
+
+
 def format_single_player_response(
     player_name: str,
     stat_type: str,
@@ -1175,6 +1258,8 @@ def format_single_player_response(
                 total_all_games += tgp if tgp is not None else gp
             total_odds_raw = (total_gp / total_hits) if total_hits else None
             lines.append(_fmt_season_bullet("Total", stat_type, total_gp, total_hits, total_odds_raw, total_gp=total_all_games if total_all_games else None))
+            lines.append("")
+            lines.append(_data_range_footer())
             return "\n".join(lines)
 
     # Fallback: aggregate from full CSV
@@ -1184,8 +1269,113 @@ def format_single_player_response(
     total_games = stats.get("total_games", 0)
     return (
         f"{header}\n\n"
-        f"• {season_range} — GP {total_games} | {stat_type} {hits}/{total_games} ({pct:.2f}%, {odds_str})"
+        f"• {season_range} — GP {total_games} | {stat_type} {hits}/{total_games} ({pct:.2f}%, {odds_str})\n\n"
+        f"{_data_range_footer()}"
     )
+
+
+def format_all_stats_summary(
+    player_name: str,
+    season_from: int,
+    season_to: int,
+    minutes_band: str | None = None,
+    position: str | None = None,
+) -> str:
+    """
+    Show all 5 markets as a compact summary line, then per-season ATS breakdown.
+    Used when the user asks for generic 'stats?' without specifying a market.
+    """
+    team, pos = _current_meta(player_name)
+    band = minutes_band or DEFAULT_MINUTES_BAND
+    season_range = f"{season_from}–{season_to}" if season_from != season_to else str(season_from)
+    filter_parts = []
+    if position:
+        filter_parts.append(position)
+    elif pos:
+        filter_parts.append(pos)
+    filter_parts.append(band)
+    filter_parts.append(season_range)
+    header = f"{player_name} — Try Scoring Stats ({', '.join(filter_parts)})"
+
+    mb_df = _get_minutesbands()
+    if mb_df.empty or "Player" not in mb_df.columns:
+        return f"{header}\n\nNo data found.\n\n{_data_range_footer()}"
+
+    player_rows = mb_df[mb_df["Player"].astype(str).str.strip() == player_name.strip()].copy()
+    player_rows = player_rows[player_rows["Minutes_Band"] == band]
+    if position and position.strip().lower() not in ("", "all"):
+        player_rows = player_rows[player_rows["Position"].astype(str).str.strip() == position.strip()]
+    player_rows = player_rows[
+        (player_rows["Season"] >= season_from) & (player_rows["Season"] <= season_to)
+    ]
+
+    if player_rows.empty:
+        return f"{header}\n\nNo data found for this filter combination.\n\n{_data_range_footer()}"
+
+    stat_cols = [s for s in STAT_COLUMNS if s in player_rows.columns]
+    totals: dict[str, int] = {}
+    total_gp = int(player_rows["Games played"].sum())
+    for s in stat_cols:
+        totals[s] = int(pd.to_numeric(player_rows[s], errors="coerce").fillna(0).sum())
+
+    # Summary line for all markets
+    summary_parts = []
+    for s in stat_cols:
+        hits = totals[s]
+        gp = total_gp
+        pct = (hits / gp * 100) if gp else 0.0
+        odds = f"${gp/hits:.2f}" if hits > 0 else "—"
+        summary_parts.append(f"{s} {hits}/{gp} ({pct:.1f}%, {odds})")
+
+    # Per-season ATS breakdown
+    agg = player_rows.groupby("Season")[["Games played", "ATS"]].sum().reset_index()
+    agg = agg.sort_values("Season")
+
+    # Total games per season (for display as GP band/total)
+    all_pos_rows = mb_df[mb_df["Player"].astype(str).str.strip() == player_name.strip()].copy()
+    if position and position.strip().lower() not in ("", "all"):
+        all_pos_rows = all_pos_rows[all_pos_rows["Position"].astype(str).str.strip() == position.strip()]
+    all_pos_rows = all_pos_rows[
+        (all_pos_rows["Season"] >= season_from) & (all_pos_rows["Season"] <= season_to)
+    ]
+    total_games_map: dict[int, int] = {}
+    if "Total Games played" in all_pos_rows.columns and not all_pos_rows.empty:
+        total_games_map = (
+            all_pos_rows.groupby(["Season", "Position"])["Total Games played"]
+            .first()
+            .reset_index()
+            .groupby("Season")["Total Games played"]
+            .sum()
+            .astype(int)
+            .to_dict()
+        )
+
+    lines = [header, ""]
+    lines.append("Summary (all markets):")
+    for part in summary_parts:
+        lines.append(f"• {part}")
+    lines.append("")
+    lines.append("Per season (ATS):")
+
+    ats_total_gp = 0
+    ats_total_hits = 0
+    ats_total_all = 0
+    for _, row in agg.iterrows():
+        season_int = int(row["Season"])
+        gp = int(row.get("Games played", 0))
+        hits = int(pd.to_numeric(row.get("ATS", 0), errors="coerce") or 0)
+        tgp = total_games_map.get(season_int)
+        odds_raw = (gp / hits) if hits > 0 else None
+        lines.append(_fmt_season_bullet(str(season_int), "ATS", gp, hits, odds_raw, total_gp=tgp))
+        ats_total_gp += gp
+        ats_total_hits += hits
+        ats_total_all += tgp if tgp is not None else gp
+
+    total_odds_raw = (ats_total_gp / ats_total_hits) if ats_total_hits else None
+    lines.append(_fmt_season_bullet("Total", "ATS", ats_total_gp, ats_total_hits, total_odds_raw, total_gp=ats_total_all if ats_total_all else None))
+    lines.append("")
+    lines.append(_data_range_footer())
+    return "\n".join(lines)
 
 
 def format_ranking_response(
@@ -1226,6 +1416,7 @@ def format_ranking_response(
         )
     lines.append("")
     lines.append(f"• Filters: {', '.join(filter_parts)}. Inactive since 2024 excluded.")
+    lines.append(_data_range_footer())
     return "\n".join(lines)
 
 
@@ -1280,6 +1471,298 @@ def format_value_response(
         lines.append(f"• Still value down to ${value['value_floor']:.2f} (20% benchmark)")
     elif hist_odds is not None and hist_odds > 0:
         lines.append(f"• Would be value at or above ${hist_odds:.2f} (20% benchmark)")
+    lines.append("")
+    lines.append(_data_range_footer())
+    return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
+# Summary CSV helpers — model odds, historical, bookmaker prices
+# ---------------------------------------------------------------------------
+
+# Maps market key → (summary CSV historical col, summary CSV model col or None)
+_SUMMARY_HIST_COL: dict[str, tuple[str, str | None]] = {
+    "FTS": ("FTS Historical", "FTS Model"),
+    "ATS": ("ATS Historical", "ATS Model"),
+    "LTS": ("LTS Historical", None),
+    "FTS2H": ("FTS2H Historical", None),
+    "2+": ("TPT Historical", None),
+}
+
+
+def get_summary_row(player_name: str, stat_type: str) -> dict[str, Any]:
+    """
+    Read the appropriate summary CSV and return a dict with:
+      hist_odds, model_odds (or None), highest_price, highest_bookie,
+      value_vs_hist (%), value_vs_model (% or None), market_value (%),
+      all_prices: list of {website, price}
+    Returns an empty dict if no data found.
+    """
+    market_norm = stat_type.upper() if stat_type != STAT_2PLUS else STAT_2PLUS
+    filenames = _SUMMARY_CSV.get(market_norm)
+    if not filenames:
+        return {}
+
+    for base in (_BASE_DIR, _REPO_DATA):
+        path = os.path.join(base, filenames[0])
+        if not os.path.isfile(path):
+            continue
+        try:
+            df = pd.read_csv(path)
+            df.columns = [str(c).strip() for c in df.columns]
+            if "Player" not in df.columns:
+                return {}
+            mask = df["Player"].astype(str).str.strip().str.lower() == player_name.strip().lower()
+            rows = df.loc[mask]
+            if rows.empty:
+                return {}
+            row = rows.iloc[0]
+
+            hist_col, model_col = _SUMMARY_HIST_COL.get(market_norm, (None, None))
+
+            def _safe_float(val: Any) -> float | None:
+                if val is None or (isinstance(val, float) and pd.isna(val)):
+                    return None
+                try:
+                    v = float(pd.to_numeric(val, errors="coerce"))
+                    return v if not pd.isna(v) and v > 0 else None
+                except (TypeError, ValueError):
+                    return None
+
+            hist_odds = _safe_float(row.get(hist_col)) if hist_col and hist_col in df.columns else None
+            model_odds = _safe_float(row.get(model_col)) if model_col and model_col in df.columns else None
+            highest = _safe_float(row.get("Highest"))
+            val_hist = _safe_float(row.get("Highest/Historical"))
+            val_model = _safe_float(row.get("Highest/Model"))
+            market_value = _safe_float(row.get("Market Value"))
+
+            # Individual bookmaker prices
+            all_prices: list[dict[str, Any]] = []
+            for col in sorted(_PRICE_COLUMNS):
+                if col in df.columns:
+                    p = _safe_float(row.get(col))
+                    if p is not None:
+                        all_prices.append({"website": col, "price": p})
+            all_prices.sort(key=lambda x: -x["price"])
+
+            best = all_prices[0] if all_prices else None
+
+            return {
+                "player_name": str(row.get("Player", player_name)).strip(),
+                "team": str(row.get("Team", "")).strip() or None,
+                "market": market_norm,
+                "hist_odds": hist_odds,
+                "model_odds": model_odds,
+                "highest_price": highest,
+                "highest_bookie": best["website"] if best else None,
+                "value_vs_hist": val_hist,
+                "value_vs_model": val_model,
+                "market_value": market_value,
+                "all_prices": all_prices,
+            }
+        except Exception:
+            continue
+    return {}
+
+
+def format_combined_bet_response(
+    player_name: str,
+    stat_type: str,
+    summary: dict[str, Any],
+    season_from: int,
+    season_to: int,
+    minutes_band: str | None = None,
+) -> str:
+    """
+    Combined bet analysis: bookmaker prices + model/historical odds + value verdict.
+    Used when user asks 'best price + is it a good bet?' in one query.
+    """
+    band = minutes_band or DEFAULT_MINUTES_BAND
+    _, pos = _current_meta(player_name)
+    filter_parts = []
+    if pos:
+        filter_parts.append(pos)
+    filter_parts.append(band)
+    season_range = f"{season_from}–{season_to}" if season_from != season_to else str(season_from)
+    filter_parts.append(season_range)
+
+    lines = [f"{player_name} — {stat_type} Bet Analysis ({', '.join(filter_parts)})", ""]
+
+    all_prices = summary.get("all_prices", [])
+    highest = summary.get("highest_price")
+    best_bookie = summary.get("highest_bookie")
+
+    if all_prices:
+        if highest and best_bookie:
+            lines.append(f"Best available price: ${highest:.2f} on {best_bookie}  ◄")
+        lines.append("")
+        lines.append("All bookmakers:")
+        for o in all_prices:
+            marker = "  ◄ best" if best_bookie and o["website"] == best_bookie and o["price"] == highest else ""
+            lines.append(f"• {o['website']}: ${o['price']:.2f}{marker}")
+    else:
+        lines.append("No bookmaker prices available this round.")
+
+    lines.append("")
+
+    hist_odds = summary.get("hist_odds")
+    model_odds = summary.get("model_odds")
+    val_hist = summary.get("value_vs_hist")
+    val_model = summary.get("value_vs_model")
+
+    if hist_odds:
+        hist_pct = round(100.0 / hist_odds, 1)
+        lines.append(f"Historical odds: ${hist_odds:.2f}  (scores ~{hist_pct:.1f}% of games)")
+    if model_odds:
+        lines.append(f"Model odds:      ${model_odds:.2f}")
+
+    if val_hist is not None or val_model is not None:
+        lines.append("")
+        val_parts = []
+        if val_hist is not None:
+            val_parts.append(f"{val_hist:.0f}% of historical")
+        if val_model is not None:
+            val_parts.append(f"{val_model:.0f}% of model")
+        lines.append(f"Best price is:   {' | '.join(val_parts)}")
+
+    lines.append("")
+    # Verdict
+    is_value_hist = val_hist is not None and val_hist >= 100
+    is_value_model = val_model is not None and val_model >= 100
+    if is_value_hist and is_value_model:
+        verdict = "Positive value vs both model and historical rates. Worth considering."
+    elif is_value_hist:
+        verdict = "Positive value vs historical rate. Model suggests tighter."
+    elif is_value_model:
+        verdict = "Positive value vs model. Historical rate is shorter."
+    elif highest and hist_odds and highest >= hist_odds * 0.90:
+        verdict = "Close to fair value (within 10% of historical rate)."
+    else:
+        verdict = "Negative value — best price is below historical and model rates."
+
+    lines.append(f"Verdict: {verdict}")
+
+    # Historical stats context
+    df_full, _, _ = load_data()
+    match = df_full[df_full["Player"].astype(str).str.strip() == player_name.strip()]
+    if not match.empty:
+        pid = int(match.iloc[0]["player_id"])
+        stats = compute_player_stats(pid, stat_type, season_from, season_to)
+        gp = stats.get("total_games", 0)
+        hits = stats.get("stat_hits", 0)
+        hist_rate = f"{hits}/{gp}" if gp else "no data"
+        if gp:
+            pct = round(hits / gp * 100, 1)
+            hist_rate = f"{hits}/{gp} ({pct}%)"
+        lines.append(f"Historical record: {stat_type} {hist_rate} over {season_range}")
+
+    lines.append("")
+    lines.append(_data_range_footer())
+    return "\n".join(lines)
+
+
+def get_round_value_bets(stat_type: str, top_n: int = 10, min_games: int = 5) -> list[dict[str, Any]]:
+    """
+    Return top-N value plays for this round from summary CSVs.
+    A bet is considered value when the best available price exceeds
+    the historical rate (Highest/Historical > 100).
+    min_games filters out players with very few career games (noisy stats).
+    """
+    market_norm = stat_type.upper() if stat_type != STAT_2PLUS else STAT_2PLUS
+    filenames = _SUMMARY_CSV.get(market_norm)
+    if not filenames:
+        return []
+
+    for base in (_BASE_DIR, _REPO_DATA):
+        path = os.path.join(base, filenames[0])
+        if not os.path.isfile(path):
+            continue
+        try:
+            df = pd.read_csv(path)
+            df.columns = [str(c).strip() for c in df.columns]
+            required = ["Player", "Highest", "Highest/Historical"]
+            if not all(c in df.columns for c in required):
+                return []
+
+            df["Highest"] = pd.to_numeric(df["Highest"], errors="coerce")
+            df["Highest/Historical"] = pd.to_numeric(df["Highest/Historical"], errors="coerce")
+
+            hist_col, model_col = _SUMMARY_HIST_COL.get(market_norm, (None, None))
+            if hist_col and hist_col in df.columns:
+                df[hist_col] = pd.to_numeric(df[hist_col], errors="coerce")
+            if model_col and model_col in df.columns:
+                df[model_col] = pd.to_numeric(df[model_col], errors="coerce")
+            if "Highest/Model" in df.columns:
+                df["Highest/Model"] = pd.to_numeric(df["Highest/Model"], errors="coerce")
+            if "Games" in df.columns:
+                df["Games"] = pd.to_numeric(df["Games"], errors="coerce")
+
+            value_mask = (
+                df["Highest/Historical"].notna()
+                & (df["Highest/Historical"] > 100)
+                & df["Highest"].notna()
+                & (df["Highest"] > 0)
+            )
+            # Filter out players with too few historical games (noisy stats)
+            if "Games" in df.columns:
+                value_mask = value_mask & (df["Games"].fillna(0) >= min_games)
+            value_df = df[value_mask].sort_values("Highest/Historical", ascending=False).head(top_n)
+
+            # Best bookie for each row
+            price_cols_present = sorted([c for c in _PRICE_COLUMNS if c in df.columns])
+
+            result = []
+            for _, row in value_df.iterrows():
+                bookie_prices: list[dict[str, Any]] = []
+                for col in price_cols_present:
+                    try:
+                        v = float(pd.to_numeric(row.get(col), errors="coerce"))
+                        if not pd.isna(v) and v > 0:
+                            bookie_prices.append({"website": col, "price": v})
+                    except (TypeError, ValueError):
+                        continue
+                bookie_prices.sort(key=lambda x: -x["price"])
+                best = bookie_prices[0] if bookie_prices else None
+
+                result.append({
+                    "player_name": str(row.get("Player", "")).strip(),
+                    "team": str(row.get("Team", "")).strip() or None,
+                    "hist_odds": float(row[hist_col]) if hist_col and hist_col in df.columns and pd.notna(row.get(hist_col)) else None,
+                    "model_odds": float(row[model_col]) if model_col and model_col in df.columns and pd.notna(row.get(model_col)) else None,
+                    "highest_price": float(row["Highest"]),
+                    "highest_bookie": best["website"] if best else None,
+                    "value_vs_hist": float(row["Highest/Historical"]),
+                    "value_vs_model": float(row["Highest/Model"]) if "Highest/Model" in df.columns and pd.notna(row.get("Highest/Model")) else None,
+                    "stat_type": market_norm,
+                })
+            return result
+        except Exception:
+            continue
+    return []
+
+
+def format_round_value_response(rows: list[dict[str, Any]], stat_type: str) -> str:
+    """Numbered list of this round's best value bets for a given market."""
+    if not rows:
+        return (
+            f"No value {stat_type} bets found this round based on historical rates.\n"
+            "Try a different market (e.g. ATS, FTS, LTS)."
+        )
+    lines = [f"Best value {stat_type} bets this round:", ""]
+    for i, r in enumerate(rows, 1):
+        name = r["player_name"]
+        team = f" ({r['team']})" if r.get("team") else ""
+        hist_str = f"${r['hist_odds']:.2f}" if r.get("hist_odds") else "—"
+        model_str = f" | model ${r['model_odds']:.2f}" if r.get("model_odds") else ""
+        best_price = r.get("highest_price")
+        best_bookie = r.get("highest_bookie", "")
+        price_str = f"${best_price:.2f} on {best_bookie}" if best_price and best_bookie else ("—" if not best_price else f"${best_price:.2f}")
+        val_pct = r.get("value_vs_hist")
+        val_str = f" ({val_pct:.0f}% of hist)" if val_pct else ""
+        lines.append(f"{i}) {name}{team} — hist {hist_str}{model_str} | best {price_str}{val_str}")
+    lines.append("")
+    lines.append(f"• Value = best available price exceeds historical rate (Highest/Historical > 100%).")
+    lines.append(_data_range_footer())
     return "\n".join(lines)
 
 
@@ -1288,6 +1771,23 @@ def _rule_based_response(pq: "ParsedQuery", message: str) -> str:
     season_from, season_to = resolve_timeframe(pq)
     norm_msg = normalize_text(message)
     mb = pq.minutes_band
+
+    # Round value bets — no player needed; checked before per-player routes
+    if pq.round_value_request:
+        stat = pq.stat_type or "ATS"
+        rows = get_round_value_bets(stat, top_n=10)
+        return format_round_value_response(rows, stat)
+
+    # Combined bet analysis — best prices + value assessment in one response
+    if pq.bet_analysis_request and pq.player_names:
+        name = pq.player_names[0]
+        stat = pq.stat_type or "FTS"
+        summary = get_summary_row(name, stat)
+        if summary:
+            return format_combined_bet_response(name, stat, summary, season_from, season_to, minutes_band=mb)
+        # Fall through to plain price response if no summary data
+        offers = get_live_prices(name, stat)
+        return format_best_prices_response(name, stat, offers)
 
     # Best available price — always deterministic
     if pq.best_price_request and pq.player_names:
@@ -1322,7 +1822,15 @@ def _rule_based_response(pq: "ParsedQuery", message: str) -> str:
 
     # Single or few players
     if pq.player_names and not pq.top_n:
-        stat = pq.stat_type or "ATS"
+        # When no stat type specified, show all-markets summary
+        if pq.stat_type is None:
+            pos = pq.positions[0] if pq.positions else None
+            parts = []
+            for name in pq.player_names[:5]:
+                parts.append(format_all_stats_summary(name, season_from, season_to, minutes_band=mb, position=pos))
+            return "\n\n".join(parts)
+
+        stat = pq.stat_type
         parts = []
         for name in pq.player_names[:5]:
             df_full, _, _ = load_data()
@@ -1389,6 +1897,14 @@ def get_chat_response(message: str, history: list[dict]) -> str:
     # Disambiguation takes priority — ask user to clarify before doing anything else
     if pq.ambiguous_name_map and not pq.player_names:
         return _build_disambiguation_message(pq.ambiguous_name_map)
+
+    # Round value bets — deterministic, never delegate to RAG
+    if pq.round_value_request:
+        return _rule_based_response(pq, message)
+
+    # Combined bet analysis — deterministic (prices + value), never delegate to RAG
+    if pq.bet_analysis_request and pq.player_names:
+        return _rule_based_response(pq, message)
 
     # Always handle price/bookmaker requests deterministically — never delegate to RAG
     if pq.best_price_request and pq.player_names:
