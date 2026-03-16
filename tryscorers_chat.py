@@ -1051,8 +1051,133 @@ def compute_rankings(
     top_n: int,
     ascending: bool = False,
     min_pct: float | None = None,
+    minutes_band: str | None = None,
 ) -> list[dict[str, Any]]:
-    """Rank players by percentage; apply all filters; exclude inactive since 2024."""
+    """
+    Rank players by try-scoring percentage using the minutes-bands CSV.
+    Denominator = Total Games played (all games in season range, regardless of minutes band).
+    Numerator = stat hits from the specified minutes_band (default Over 20 mins).
+    Position filter applied directly from the minutes-bands CSV Position column.
+    Inactive-since-2024 filter based on Total Games played >= 2024.
+    """
+    mb_df = _get_minutesbands()
+    if mb_df.empty:
+        # Fall back to legacy full CSV if minutes-bands data unavailable
+        return _compute_rankings_legacy(
+            stat_type, season_from, season_to, positions,
+            min_games, min_games_since_2024, top_n, ascending, min_pct
+        )
+
+    band = minutes_band or DEFAULT_MINUTES_BAND
+    stat_col_name = stat_type  # column name in minutes-bands CSV matches stat type directly
+
+    # Season filter
+    sub = mb_df[(mb_df["Season"] >= season_from) & (mb_df["Season"] <= season_to)].copy()
+
+    # Position filter (from minutes-bands CSV Position column)
+    if positions and "Position" in sub.columns:
+        sub = sub[sub["Position"].astype(str).str.strip().isin(positions)]
+
+    if sub.empty:
+        return []
+
+    # --- Total Games: deduplicate per Player/Season/Position, sum across positions per player ---
+    # This gives us the true total games played regardless of minutes band
+    if "Total Games played" in sub.columns:
+        totals_df = (
+            sub.groupby(["Player", "Season", "Position"])["Total Games played"]
+            .first()
+            .reset_index()
+            .groupby("Player")["Total Games played"]
+            .sum()
+            .astype(int)
+            .rename("total_games")
+        )
+    else:
+        totals_df = pd.Series(dtype=int, name="total_games")
+
+    # --- Stat hits: filter to specific minutes band ---
+    band_sub = sub[sub["Minutes_Band"] == band].copy()
+    if stat_col_name not in band_sub.columns:
+        return []
+
+    hits_df = (
+        band_sub.groupby("Player")[stat_col_name]
+        .sum()
+        .astype(int)
+        .rename("stat_hits")
+    )
+
+    # Merge total_games + stat_hits
+    agg = pd.DataFrame({"total_games": totals_df, "stat_hits": hits_df}).fillna(0)
+    agg["total_games"] = agg["total_games"].astype(int)
+    agg["stat_hits"] = agg["stat_hits"].astype(int)
+    agg = agg[agg["total_games"] > 0].copy()
+    agg["pct"] = (agg["stat_hits"] / agg["total_games"] * 100).round(2)
+    agg["hist_odds"] = (agg["total_games"] / agg["stat_hits"]).round(2).where(agg["stat_hits"] > 0, other=None)
+    agg = agg.reset_index().rename(columns={"Player": "player_name"})
+
+    # Inactive-since-2024 filter: player must have Total Games played >= 2024
+    if "Total Games played" in mb_df.columns:
+        recent_sub = mb_df[mb_df["Season"] >= 2024].copy()
+        if positions and "Position" in recent_sub.columns:
+            recent_sub = recent_sub[recent_sub["Position"].astype(str).str.strip().isin(positions)]
+        recent_totals = (
+            recent_sub.groupby(["Player", "Season", "Position"])["Total Games played"]
+            .first()
+            .reset_index()
+            .groupby("Player")["Total Games played"]
+            .sum()
+            .astype(int)
+        )
+        agg["recent_2024"] = agg["player_name"].map(recent_totals).fillna(0).astype(int)
+        agg = agg[agg["recent_2024"] >= (min_games_since_2024 or 0)]
+
+    agg = agg[agg["total_games"] >= (min_games or 0)]
+    if min_pct is not None:
+        agg = agg[agg["pct"] >= min_pct]
+
+    agg = agg.sort_values(
+        by=["pct", "stat_hits", "total_games", "player_name"],
+        ascending=[ascending, False, False, True],
+    )
+    rows = agg.head(top_n)
+    result = []
+    for _, r in rows.iterrows():
+        name = r["player_name"]
+        team, pos = _current_meta(name)
+        # Prefer position from the minutes-bands data if _current_meta returns None
+        if pos is None and positions:
+            pos = positions[0] if len(positions) == 1 else None
+        if pos is None and "Position" in band_sub.columns:
+            player_positions = band_sub[band_sub["Player"].astype(str).str.strip() == str(name).strip()]["Position"].dropna().unique()
+            if len(player_positions) == 1:
+                pos = str(player_positions[0]).strip()
+        result.append({
+            "player_name": name,
+            "team": team,
+            "position": pos,
+            "total_games": int(r["total_games"]),
+            "stat_hits": int(r["stat_hits"]),
+            "stat_type": stat_type,
+            "pct": float(r["pct"]),
+            "hist_odds": float(r["hist_odds"]) if r["hist_odds"] is not None and pd.notna(r["hist_odds"]) else None,
+        })
+    return result
+
+
+def _compute_rankings_legacy(
+    stat_type: str,
+    season_from: int,
+    season_to: int,
+    positions: list[str],
+    min_games: int | None,
+    min_games_since_2024: int | None,
+    top_n: int,
+    ascending: bool = False,
+    min_pct: float | None = None,
+) -> list[dict[str, Any]]:
+    """Fallback ranking using legacy full CSV. Used only when minutes-bands data is unavailable."""
     df_full, df_players, _ = load_data()
     col = _stat_col(stat_type)
     mask = _get_season_mask(df_full, season_from, season_to)
@@ -1076,15 +1201,11 @@ def compute_rankings(
         agg = agg[agg["pct"] >= min_pct]
 
     if positions:
-        if df_players.empty or "Position" not in df_players.columns:
-            pass
-        else:
+        if not df_players.empty and "Position" in df_players.columns:
             pos_map = df_players.set_index(df_players["Player"].astype(str).str.strip())["Position"].astype(str).str.strip().to_dict()
-            def allowed(name):
-                p = pos_map.get(str(name).strip() if isinstance(name, str) else str(name).strip())
-                if p is None:
-                    return False
-                return p in positions
+            def allowed(name: str) -> bool:
+                p = pos_map.get(str(name).strip())
+                return p in positions if p else False
             agg = agg[agg["player_name"].map(allowed)]
 
     agg = agg[agg["total_games"] > 0]
@@ -1092,13 +1213,11 @@ def compute_rankings(
         by=["pct", "stat_hits", "total_games", "player_name"],
         ascending=[ascending, False, False, True],
     )
-    rows = agg.head(top_n)
     result = []
-    for _, r in rows.iterrows():
+    for _, r in agg.head(top_n).iterrows():
         name = r["player_name"]
         team, pos = _current_meta(name)
         result.append({
-            "player_id": int(r["player_id"]),
             "player_name": name,
             "team": team,
             "position": pos,
@@ -1411,11 +1530,12 @@ def format_ranking_response(
         if meta_parts:
             label += f" ({', '.join(meta_parts)})"
         odds_str = _fmt_odds_str(r.get("hist_odds"))
+        # total_games is all games played (Total Games played); stat_hits scored in that window
         lines.append(
-            f"{i}) {label} — {stat_type} {r['stat_hits']}/{r['total_games']} ({r['pct']:.2f}%), hist {odds_str}"
+            f"{i}) {label} — {stat_type} {r['stat_hits']}/{r['total_games']} games ({r['pct']:.1f}%), hist {odds_str}"
         )
     lines.append("")
-    lines.append(f"• Filters: {', '.join(filter_parts)}. Inactive since 2024 excluded.")
+    lines.append(f"• Filters: {', '.join(filter_parts)}. GP = total games played in period. Inactive since 2024 excluded.")
     lines.append(_data_range_footer())
     return "\n".join(lines)
 
@@ -1574,7 +1694,7 @@ def format_combined_bet_response(
     minutes_band: str | None = None,
 ) -> str:
     """
-    Combined bet analysis: bookmaker prices + model/historical odds + value verdict.
+    Combined bet analysis: model odds first, then market prices, hist secondary.
     Used when user asks 'best price + is it a good bet?' in one query.
     """
     band = minutes_band or DEFAULT_MINUTES_BAND
@@ -1588,74 +1708,95 @@ def format_combined_bet_response(
 
     lines = [f"{player_name} — {stat_type} Bet Analysis ({', '.join(filter_parts)})", ""]
 
+    hist_odds = summary.get("hist_odds")
+    model_odds = summary.get("model_odds")
+    val_hist = summary.get("value_vs_hist")
+    val_model = summary.get("value_vs_model")
     all_prices = summary.get("all_prices", [])
     highest = summary.get("highest_price")
     best_bookie = summary.get("highest_bookie")
 
+    # --- Historical record (for narrative context) ---
+    df_full, _, _ = load_data()
+    match = df_full[df_full["Player"].astype(str).str.strip() == player_name.strip()]
+    gp_total = 0
+    hits_total = 0
+    if not match.empty:
+        pid = int(match.iloc[0]["player_id"])
+        stats = compute_player_stats(pid, stat_type, season_from, season_to)
+        gp_total = stats.get("total_games", 0)
+        hits_total = stats.get("stat_hits", 0)
+
+    # --- 1. Model odds (primary signal) ---
+    if model_odds:
+        model_pct = round(100.0 / model_odds, 1)
+        lines.append(f"Model odds: ${model_odds:.2f}  (model scores ~{model_pct:.1f}% of games)")
+        if gp_total and hits_total:
+            hist_pct_val = round(hits_total / gp_total * 100, 1)
+            lines.append(
+                f"Historical record: {stat_type} {hits_total}/{gp_total} ({hist_pct_val}%) over {season_range}"
+            )
+            if hist_odds:
+                hist_pct_odds = round(100.0 / hist_odds, 1)
+                if abs(model_pct - hist_pct_odds) < 2:
+                    lines.append("Model and historical rates are closely aligned.")
+                elif model_pct > hist_pct_odds:
+                    lines.append(
+                        f"Model is more optimistic than history ({model_pct:.1f}% vs {hist_pct_odds:.1f}%)."
+                    )
+                else:
+                    lines.append(
+                        f"Model is more conservative than history ({model_pct:.1f}% vs {hist_pct_odds:.1f}%)."
+                    )
+        lines.append("")
+
+    # --- 2. Best market price vs model ---
     if all_prices:
         if highest and best_bookie:
             lines.append(f"Best available price: ${highest:.2f} on {best_bookie}  ◄")
+        if model_odds and val_model is not None:
+            lines.append(f"Best price is {val_model:.0f}% of model (model = ${model_odds:.2f})")
         lines.append("")
         lines.append("All bookmakers:")
         for o in all_prices:
             marker = "  ◄ best" if best_bookie and o["website"] == best_bookie and o["price"] == highest else ""
             lines.append(f"• {o['website']}: ${o['price']:.2f}{marker}")
+        # Note large price spread across bookies
+        if len(all_prices) >= 2:
+            low = all_prices[-1]["price"]
+            high = all_prices[0]["price"]
+            if high > 0 and low > 0 and (high / low) >= 1.5:
+                lines.append(
+                    f"  (Wide spread: ${low:.2f}–${high:.2f} — shopping around makes a difference)"
+                )
     else:
         lines.append("No bookmaker prices available this round.")
 
-    lines.append("")
-
-    hist_odds = summary.get("hist_odds")
-    model_odds = summary.get("model_odds")
-    val_hist = summary.get("value_vs_hist")
-    val_model = summary.get("value_vs_model")
-
+    # --- 3. Historical odds (secondary) ---
     if hist_odds:
         hist_pct = round(100.0 / hist_odds, 1)
-        lines.append(f"Historical odds: ${hist_odds:.2f}  (scores ~{hist_pct:.1f}% of games)")
-    if model_odds:
-        lines.append(f"Model odds:      ${model_odds:.2f}")
-
-    if val_hist is not None or val_model is not None:
+        val_hist_str = f" ({val_hist:.0f}% of hist)" if val_hist is not None else ""
         lines.append("")
-        val_parts = []
-        if val_hist is not None:
-            val_parts.append(f"{val_hist:.0f}% of historical")
-        if val_model is not None:
-            val_parts.append(f"{val_model:.0f}% of model")
-        lines.append(f"Best price is:   {' | '.join(val_parts)}")
+        lines.append(f"Historical odds: ${hist_odds:.2f}  (scores ~{hist_pct:.1f}% historically){val_hist_str}")
 
+    # --- 4. Verdict ---
     lines.append("")
-    # Verdict
-    is_value_hist = val_hist is not None and val_hist >= 100
     is_value_model = val_model is not None and val_model >= 100
-    if is_value_hist and is_value_model:
-        verdict = "Positive value vs both model and historical rates. Worth considering."
-    elif is_value_hist:
-        verdict = "Positive value vs historical rate. Model suggests tighter."
+    is_value_hist = val_hist is not None and val_hist >= 100
+    if is_value_model and is_value_hist:
+        verdict = "Strong value signal — best price beats both model and historical rates."
     elif is_value_model:
-        verdict = "Positive value vs model. Historical rate is shorter."
+        verdict = "Model says value. Best price beats model odds — worth considering."
+    elif is_value_hist:
+        verdict = "Historical value. Best price beats historical rate, but model suggests tighter odds."
+    elif highest and model_odds and highest >= model_odds * 0.90:
+        verdict = "Close to model fair value (within 10%). Marginal edge at best."
     elif highest and hist_odds and highest >= hist_odds * 0.90:
-        verdict = "Close to fair value (within 10% of historical rate)."
+        verdict = "Close to historical fair value (within 10%). No clear edge."
     else:
-        verdict = "Negative value — best price is below historical and model rates."
+        verdict = "No value — best price is below both model and historical rates."
 
     lines.append(f"Verdict: {verdict}")
-
-    # Historical stats context
-    df_full, _, _ = load_data()
-    match = df_full[df_full["Player"].astype(str).str.strip() == player_name.strip()]
-    if not match.empty:
-        pid = int(match.iloc[0]["player_id"])
-        stats = compute_player_stats(pid, stat_type, season_from, season_to)
-        gp = stats.get("total_games", 0)
-        hits = stats.get("stat_hits", 0)
-        hist_rate = f"{hits}/{gp}" if gp else "no data"
-        if gp:
-            pct = round(hits / gp * 100, 1)
-            hist_rate = f"{hits}/{gp} ({pct}%)"
-        lines.append(f"Historical record: {stat_type} {hist_rate} over {season_range}")
-
     lines.append("")
     lines.append(_data_range_footer())
     return "\n".join(lines)
@@ -1664,8 +1805,9 @@ def format_combined_bet_response(
 def get_round_value_bets(stat_type: str, top_n: int = 10, min_games: int = 5) -> list[dict[str, Any]]:
     """
     Return top-N value plays for this round from summary CSVs.
-    A bet is considered value when the best available price exceeds
-    the historical rate (Highest/Historical > 100).
+    Primary: model is available and best market price beats model odds (Highest/Model > 100).
+    Fallback: best market price beats historical rate (Highest/Historical > 100).
+    Sorted by Highest/Model desc first, then Highest/Historical desc.
     min_games filters out players with very few career games (noisy stats).
     """
     market_norm = stat_type.upper() if stat_type != STAT_2PLUS else STAT_2PLUS
@@ -1697,18 +1839,39 @@ def get_round_value_bets(stat_type: str, top_n: int = 10, min_games: int = 5) ->
             if "Games" in df.columns:
                 df["Games"] = pd.to_numeric(df["Games"], errors="coerce")
 
-            value_mask = (
-                df["Highest/Historical"].notna()
-                & (df["Highest/Historical"] > 100)
-                & df["Highest"].notna()
-                & (df["Highest"] > 0)
-            )
-            # Filter out players with too few historical games (noisy stats)
+            # Base filter: market price must beat at least one signal
+            has_model_col = "Highest/Model" in df.columns
+            if has_model_col:
+                value_mask = (
+                    (
+                        df["Highest/Model"].notna() & (df["Highest/Model"] > 100)
+                    ) | (
+                        df["Highest/Historical"].notna() & (df["Highest/Historical"] > 100)
+                    )
+                ) & df["Highest"].notna() & (df["Highest"] > 0)
+            else:
+                value_mask = (
+                    df["Highest/Historical"].notna()
+                    & (df["Highest/Historical"] > 100)
+                    & df["Highest"].notna()
+                    & (df["Highest"] > 0)
+                )
+
             if "Games" in df.columns:
                 value_mask = value_mask & (df["Games"].fillna(0) >= min_games)
-            value_df = df[value_mask].sort_values("Highest/Historical", ascending=False).head(top_n)
 
-            # Best bookie for each row
+            value_df = df[value_mask].copy()
+
+            # Sort: Highest/Model desc first (NaN last), then Highest/Historical desc
+            if has_model_col:
+                value_df["_sort_model"] = value_df["Highest/Model"].fillna(0)
+            else:
+                value_df["_sort_model"] = 0.0
+            value_df["_sort_hist"] = value_df["Highest/Historical"].fillna(0)
+            value_df = value_df.sort_values(
+                ["_sort_model", "_sort_hist"], ascending=[False, False]
+            ).head(top_n)
+
             price_cols_present = sorted([c for c in _PRICE_COLUMNS if c in df.columns])
 
             result = []
@@ -1731,7 +1894,7 @@ def get_round_value_bets(stat_type: str, top_n: int = 10, min_games: int = 5) ->
                     "model_odds": float(row[model_col]) if model_col and model_col in df.columns and pd.notna(row.get(model_col)) else None,
                     "highest_price": float(row["Highest"]),
                     "highest_bookie": best["website"] if best else None,
-                    "value_vs_hist": float(row["Highest/Historical"]),
+                    "value_vs_hist": float(row["Highest/Historical"]) if pd.notna(row.get("Highest/Historical")) else None,
                     "value_vs_model": float(row["Highest/Model"]) if "Highest/Model" in df.columns and pd.notna(row.get("Highest/Model")) else None,
                     "stat_type": market_norm,
                 })
@@ -1742,26 +1905,37 @@ def get_round_value_bets(stat_type: str, top_n: int = 10, min_games: int = 5) ->
 
 
 def format_round_value_response(rows: list[dict[str, Any]], stat_type: str) -> str:
-    """Numbered list of this round's best value bets for a given market."""
+    """Numbered list of this round's best value bets — model + market first, hist secondary."""
     if not rows:
         return (
-            f"No value {stat_type} bets found this round based on historical rates.\n"
+            f"No value {stat_type} bets found this round.\n"
             "Try a different market (e.g. ATS, FTS, LTS)."
         )
     lines = [f"Best value {stat_type} bets this round:", ""]
     for i, r in enumerate(rows, 1):
         name = r["player_name"]
         team = f" ({r['team']})" if r.get("team") else ""
-        hist_str = f"${r['hist_odds']:.2f}" if r.get("hist_odds") else "—"
-        model_str = f" | model ${r['model_odds']:.2f}" if r.get("model_odds") else ""
         best_price = r.get("highest_price")
         best_bookie = r.get("highest_bookie", "")
         price_str = f"${best_price:.2f} on {best_bookie}" if best_price and best_bookie else ("—" if not best_price else f"${best_price:.2f}")
-        val_pct = r.get("value_vs_hist")
-        val_str = f" ({val_pct:.0f}% of hist)" if val_pct else ""
-        lines.append(f"{i}) {name}{team} — hist {hist_str}{model_str} | best {price_str}{val_str}")
+        model_odds = r.get("model_odds")
+        hist_odds = r.get("hist_odds")
+        val_model = r.get("value_vs_model")
+        val_hist = r.get("value_vs_hist")
+
+        parts = []
+        if model_odds:
+            model_val_str = f" ({val_model:.0f}% of model)" if val_model else ""
+            parts.append(f"model ${model_odds:.2f} | market {price_str}{model_val_str}")
+        else:
+            parts.append(f"market {price_str}")
+        if hist_odds:
+            hist_val_str = f" ({val_hist:.0f}% of hist)" if val_hist else ""
+            parts.append(f"hist ${hist_odds:.2f}{hist_val_str}")
+
+        lines.append(f"{i}) {name}{team} — {' | '.join(parts)}")
     lines.append("")
-    lines.append(f"• Value = best available price exceeds historical rate (Highest/Historical > 100%).")
+    lines.append("• Value = best available market price exceeds model odds and/or historical rate.")
     lines.append(_data_range_footer())
     return "\n".join(lines)
 
@@ -1853,6 +2027,7 @@ def _rule_based_response(pq: "ParsedQuery", message: str) -> str:
         rows = compute_rankings(
             stat, season_from, season_to,
             pq.positions, min_g, min_2024, n, ascending=ascending, min_pct=min_pct,
+            minutes_band=mb,
         )
         if not rows:
             return "No players match all filters. Try relaxing minimum games or position."
