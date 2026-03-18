@@ -296,6 +296,7 @@ class ParsedQuery:
     best_price_request: bool = False
     bet_analysis_request: bool = False
     round_value_request: bool = False
+    year_by_year_request: bool = False
     raw_message: str = ""
 
 
@@ -398,7 +399,14 @@ def parse_query(message: str) -> ParsedQuery:
         else:
             num = re.search(r"\b(\d+(?:\.\d+)?)\s*(?:for|ats?|fts?|odds?)", norm)
             if num:
-                pq.market_odds = float(num.group(1))
+                candidate = float(num.group(1))
+                # Guard: don't treat "top N ATS / best N FTS" as a market price
+                top_context = re.search(
+                    r"\b(?:top|best|worst|last|first)\s+" + re.escape(num.group(1)) + r"\b",
+                    norm,
+                )
+                if not top_context:
+                    pq.market_odds = candidate
             else:
                 odds = re.search(r"odds?\s+of\s+(\d+(?:\.\d+)?)", norm)
                 if odds:
@@ -438,6 +446,10 @@ def parse_query(message: str) -> ParsedQuery:
         pq.round_value_request = True
     if re.search(r"\bwho\s+is\s+(the\s+)?(best\s+)?value\b", norm):
         pq.round_value_request = True
+
+    # Year-by-year position group breakdown
+    if re.search(r"\b(each\s+year|year\s+by\s+year|by\s+year|per\s+year|annually|year\s+on\s+year|season\s+by\s+season|each\s+season)\b", norm):
+        pq.year_by_year_request = True
 
     return pq
 
@@ -511,7 +523,7 @@ def resolve_player_names(message: str, norm_text: str) -> tuple[list[str], dict[
     _SKIP_WORDS = {
         "the", "for", "and", "with", "from", "this", "that", "what", "who", "how",
         "best", "last", "first", "next", "over", "under", "round", "game", "games",
-        "try", "tries", "score", "scorer", "price", "odds", "rate", "stats", "stat",
+        "try", "tries", "score", "scorer", "price", "odds", "rate", "rates", "stats", "stat",
         "season", "seasons", "year", "years", "team", "position", "player", "players",
         "bookmaker", "bookmakers", "available", "current", "historical", "total",
         "fts", "ats", "lts", "fts2h", "2plus", "more", "half", "match", "week",
@@ -522,6 +534,18 @@ def resolve_player_names(message: str, norm_text: str) -> tuple[list[str], dict[
         "good", "great", "want", "wanna", "should", "worth", "punt",
         "pick", "picks", "play", "plays", "tip", "tips",
         "where", "wheres", "which", "there", "their", "about",
+        # Position keywords — must never be treated as player names
+        "prop", "props", "lock", "locks", "winger", "wingers", "wing", "wings",
+        "centre", "centres", "center", "centers", "fullback", "fullbacks",
+        "hooker", "hookers", "halfback", "halfbacks", "forward", "forwards",
+        "back", "backs", "middle", "middles", "edge", "spine",
+        "interchange", "bench", "each", "every", "per", "annual", "annually",
+        "compare", "compared", "versus", "ranking", "rankings", "ranked",
+        "often", "frequently", "average", "averaged", "breakdown",
+        # Common English words that fuzzy-match short player first names (e.g. "are" → "jared")
+        "are", "was", "has", "had", "not", "but", "its", "all", "can", "out",
+        "may", "get", "got", "let", "new", "old", "top", "too", "two", "use",
+        "way", "any", "our", "own", "say", "see", "him", "his", "her", "one",
     }
 
     # ------------------------------------------------------------------
@@ -599,12 +623,14 @@ def resolve_player_names(message: str, norm_text: str) -> tuple[list[str], dict[
             ambiguous_map[word] = sorted(set(first_matches))[:10]
             continue
 
-        # Pass 4: fuzzy typo correction (only when no exact match at all)
+        # Pass 4: fuzzy typo correction (only for words ≥5 chars to prevent common
+        # short English words from matching short player first names)
         fuzzy_candidates: list[str] = []
-        for fl in difflib.get_close_matches(wl, all_last_names, n=5, cutoff=0.75):
-            fuzzy_candidates.extend(last_name_map[fl])
-        for ff in difflib.get_close_matches(wl, all_first_names, n=5, cutoff=0.75):
-            fuzzy_candidates.extend(first_name_map[ff])
+        if len(wl) >= 5:
+            for fl in difflib.get_close_matches(wl, all_last_names, n=5, cutoff=0.80):
+                fuzzy_candidates.extend(last_name_map[fl])
+            for ff in difflib.get_close_matches(wl, all_first_names, n=5, cutoff=0.80):
+                fuzzy_candidates.extend(first_name_map[ff])
         # Deduplicate while preserving order
         seen_fuzzy: set[str] = set()
         deduped: list[str] = []
@@ -1228,6 +1254,117 @@ def _compute_rankings_legacy(
             "hist_odds": float(r["hist_odds"]) if pd.notna(r["hist_odds"]) else None,
         })
     return result
+
+
+def compute_position_group_by_year(
+    stat_type: str,
+    season_from: int,
+    season_to: int,
+    positions: list[str],
+    minutes_band: str | None = None,
+) -> list[dict[str, Any]]:
+    """
+    Aggregate try-scoring rates for a position group, broken down by season.
+    Uses Total Games played as denominator (all games in each season).
+    Returns one row per season with totals: total_games, stat_hits, pct, hist_odds.
+    """
+    mb_df = _get_minutesbands()
+    if mb_df.empty:
+        return []
+
+    band = minutes_band or DEFAULT_MINUTES_BAND
+    stat_col_name = stat_type
+
+    sub = mb_df[(mb_df["Season"] >= season_from) & (mb_df["Season"] <= season_to)].copy()
+    if positions and "Position" in sub.columns:
+        sub = sub[sub["Position"].astype(str).str.strip().isin(positions)]
+
+    if sub.empty or stat_col_name not in sub.columns:
+        return []
+
+    # Total Games by season: deduplicate Player/Season/Position, then sum
+    if "Total Games played" in sub.columns:
+        total_by_season = (
+            sub.groupby(["Player", "Season", "Position"])["Total Games played"]
+            .first()
+            .reset_index()
+            .groupby("Season")["Total Games played"]
+            .sum()
+            .astype(int)
+        )
+    else:
+        total_by_season = pd.Series(dtype=int)
+
+    # Stat hits by season: use the specified minutes band
+    band_sub = sub[sub["Minutes_Band"] == band].copy()
+    hits_by_season = (
+        band_sub.groupby("Season")[stat_col_name]
+        .sum()
+        .astype(int)
+    )
+
+    seasons_sorted = sorted(
+        set(total_by_season.index.tolist()) | set(hits_by_season.index.tolist())
+    )
+    result = []
+    for season in seasons_sorted:
+        tgp = int(total_by_season.get(season, 0))
+        hits = int(hits_by_season.get(season, 0))
+        if tgp == 0:
+            continue
+        pct = round(hits / tgp * 100, 1)
+        hist_odds = round(tgp / hits, 2) if hits > 0 else None
+        result.append({
+            "season": season,
+            "total_games": tgp,
+            "stat_hits": hits,
+            "pct": pct,
+            "hist_odds": hist_odds,
+        })
+
+    return result
+
+
+def format_position_group_by_year_response(
+    rows: list[dict[str, Any]],
+    stat_type: str,
+    positions: list[str],
+    season_from: int,
+    season_to: int,
+    minutes_band: str | None = None,
+) -> str:
+    """Year-by-year try-scoring rate table for a position group."""
+    band = minutes_band or DEFAULT_MINUTES_BAND
+    pos_label = " + ".join(positions) if positions else "All positions"
+    season_range = f"{season_from}–{season_to}" if season_from != season_to else str(season_from)
+    header = f"{stat_type} rates by season — {pos_label} ({band})"
+
+    if not rows:
+        return f"{header}\n\nNo data found for these filters.\n\n{_data_range_footer()}"
+
+    lines = [header, ""]
+    for r in rows:
+        odds_str = f"${r['hist_odds']:.2f}" if r["hist_odds"] else "—"
+        lines.append(
+            f"• {r['season']} — {r['stat_hits']}/{r['total_games']} games "
+            f"({r['pct']:.1f}%, {odds_str})"
+        )
+
+    # Totals row
+    total_gp = sum(r["total_games"] for r in rows)
+    total_hits = sum(r["stat_hits"] for r in rows)
+    if total_gp:
+        total_pct = round(total_hits / total_gp * 100, 1)
+        total_odds = f"${round(total_gp / total_hits, 2):.2f}" if total_hits else "—"
+        lines.append(
+            f"• Total ({season_range}) — {total_hits}/{total_gp} games "
+            f"({total_pct:.1f}%, {total_odds})"
+        )
+
+    lines.append("")
+    lines.append(f"• GP = total games played by all {pos_label} players that season.")
+    lines.append(_data_range_footer())
+    return "\n".join(lines)
 
 
 VALUE_FLOOR_PCT = 0.80
@@ -1952,6 +2089,15 @@ def _rule_based_response(pq: "ParsedQuery", message: str) -> str:
         rows = get_round_value_bets(stat, top_n=10)
         return format_round_value_response(rows, stat)
 
+    # Year-by-year position group breakdown — checked before player/ranking routes
+    if pq.year_by_year_request and pq.positions and pq.stat_type:
+        rows = compute_position_group_by_year(
+            pq.stat_type, season_from, season_to, pq.positions, minutes_band=mb
+        )
+        return format_position_group_by_year_response(
+            rows, pq.stat_type, pq.positions, season_from, season_to, minutes_band=mb
+        )
+
     # Combined bet analysis — best prices + value assessment in one response
     if pq.bet_analysis_request and pq.player_names:
         name = pq.player_names[0]
@@ -2022,6 +2168,12 @@ def _rule_based_response(pq: "ParsedQuery", message: str) -> str:
     if pq.top_n or (pq.positions and pq.stat_type):
         stat = pq.stat_type or "ATS"
         min_g, min_2024, min_pct = resolve_games_filters(pq)
+        # Apply a sensible minimum-games floor when no explicit threshold given.
+        # Position-group queries return 1/1 junk otherwise.
+        if min_g is None and pq.positions:
+            min_g = 10
+        elif min_g is None and pq.top_n:
+            min_g = 5
         n = resolve_top_n(pq)
         ascending = "worst" in normalize_text(message) or "lowest" in normalize_text(message)
         rows = compute_rankings(
@@ -2036,13 +2188,26 @@ def _rule_based_response(pq: "ParsedQuery", message: str) -> str:
             pq.positions, min_g, min_2024, min_pct, minutes_band=mb,
         )
 
+    # Comparison query: "how often do X score compared to Y" — show year-by-year for each group
+    _is_comparison = re.search(r"\b(compared?\s+to|versus|vs\.?|difference\s+between|how\s+often)\b", norm_msg)
+    if _is_comparison and pq.positions and len(pq.positions) >= 2:
+        stat = pq.stat_type or "ATS"
+        parts = []
+        for pos in pq.positions:
+            rows_yby = compute_position_group_by_year(stat, season_from, season_to, [pos], minutes_band=mb)
+            parts.append(format_position_group_by_year_response(rows_yby, stat, [pos], season_from, season_to, minutes_band=mb))
+        return "\n\n".join(parts)
+
     # Fallback
     stat = pq.stat_type or "ATS"
     if pq.positions:
         min_g, min_2024, min_pct = resolve_games_filters(pq)
+        # Always apply min_games floor for position-group fallback queries
+        min_g = min_g or 10
         rows = compute_rankings(
             stat, season_from, season_to,
             pq.positions, min_g, min_2024, 10, ascending=False, min_pct=min_pct,
+            minutes_band=mb,
         )
         if rows:
             return format_ranking_response(
